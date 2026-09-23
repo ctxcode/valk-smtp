@@ -155,8 +155,7 @@ class Reply {
         if isset(ca_dir) : ssl.set_ca_cert_dir(ca_dir) ! throw .tls { message: "Cannot read the CA directory '" + ca_dir + "'" }
         let certificate = tls.certificate_file
         if isset(certificate) {
-            let key_file = tls.private_key_file
-            let key = isset(key_file) ? key_file : certificate
+            let key = tls.private_key_file ?? certificate
             ssl.set_certificate(certificate, key, tls.key_password) ! {
                 throw .tls { message: "Cannot use the client certificate '" + certificate + "' with the key '" + key + "'" }
             }
