@@ -144,3 +144,87 @@ test "TLS: no password without TLS" {
     }
     assert(false)
 }
+
+// The SHA-256 of tests/assets/cert.pem, which also serves as the client certificate
+value TEST_CERT_SHA256 ("3293c3c64f1ec445a7e85a1315d55ae0488773ffeed4c6ab81d3da77d9c5c673")
+
+fn test_asset(name: String) String {
+    return __DIR__ + "/assets/" + name
+}
+
+// Sends one message to a fake server that wants a client certificate, and returns the
+// fingerprint of the certificate it got
+fn send_with_certificate(security: smtp.Security, tls: smtp.TlsOptions) String {
+    let fake = fake_server()
+    fake.implicit_tls = security == smtp.Security.tls
+    fake.starttls = security == smtp.Security.starttls
+    fake.require_client_certificate = true
+    let running = co serve(fake)
+    let config = fake_tls_config(fake, security)
+    tls.ca_file = test_cert()
+    config.tls = tls
+    let client = smtp.connect_with(config) ! {
+        println(E.message)
+        await running
+        return ""
+    }
+    client.send(simple_message()) ! { println(E.message) }
+    client.close()
+    if await running != "ok" : return ""
+    return fake.client_certificate
+}
+
+test "TLS: client certificate" {
+    assert(send_with_certificate(smtp.Security.tls, .{
+        certificate_file: test_cert()
+        private_key_file: test_key()
+    }) == TEST_CERT_SHA256)
+    // STARTTLS, with an encrypted key
+    assert(send_with_certificate(smtp.Security.starttls, .{
+        certificate_file: test_cert()
+        private_key_file: test_asset("key-encrypted.pem")
+        key_password: "secret"
+    }) == TEST_CERT_SHA256)
+    // The key in the certificate file
+    assert(send_with_certificate(smtp.Security.tls, .{
+        certificate_file: test_asset("cert-and-key.pem")
+    }) == TEST_CERT_SHA256)
+}
+
+test "TLS: a server that wants a client certificate refuses a client without" {
+    let fake = fake_server()
+    fake.implicit_tls = true
+    fake.require_client_certificate = true
+    let running = co serve(fake)
+    smtp.connect_with(fake_tls_config(fake, smtp.Security.tls)) ! {
+        assert(await running == "TLS handshake failed")
+        return
+    }
+    assert(false)
+}
+
+// Connects with a client key that cannot be used, and returns whether that was the error
+fn client_key_fails(key_file: String, password: String) bool {
+    let fake = fake_server()
+    fake.implicit_tls = true
+    let running = co serve(fake)
+    let config = fake_tls_config(fake, smtp.Security.tls)
+    config.tls.certificate_file = test_cert()
+    config.tls.private_key_file = key_file
+    config.tls.key_password = password
+    let client = smtp.connect_with(config) ! {
+        let failed = error_is(E.code, tls) && E.message.contains("client certificate")
+        await running
+        return failed
+    }
+    client.close()
+    await running
+    return false
+}
+
+test "TLS: client certificate errors" {
+    assert(client_key_fails(test_asset("key-encrypted.pem"), "wrong"))
+    assert(client_key_fails(test_asset("key-encrypted.pem"), ""))
+    assert(client_key_fails(test_asset("other-key.pem"), ""))
+    assert(client_key_fails(test_asset("missing.pem"), ""))
+}

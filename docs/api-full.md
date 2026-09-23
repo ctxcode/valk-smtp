@@ -528,6 +528,12 @@ own.
     + ca_dir: ?String
     // A PEM file with more certificate authorities to trust.
     + ca_file: ?String
+    // A PEM file with the client certificate, optionally followed by the intermediate certificates, sent when the server asks for one.
+    + certificate_file: ?String
+    // The password of an encrypted private key.
+    + key_password: String
+    // The PEM private key of `certificate_file`. Null reads it from `certificate_file`.
+    + private_key_file: ?String
     // Whether the certificate of the server is checked.
     + verify: bool
 }
@@ -542,8 +548,9 @@ mail provider with a certificate from a public CA needs. A server with a self-si
 certificate needs its certificate in `ca_file`, or `verify: false` to check nothing, which
 leaves the connection open to a machine in the middle.
 
-The certificate is checked against the host that was connected to. Client certificates are
-not supported.
+The certificate is checked against the host that was connected to. A server that wants to
+know the client by its certificate, such as a relay that trusts client certificates, gets
+the one in `certificate_file`.
 
 #### ca_dir
 
@@ -552,6 +559,19 @@ A directory of more certificate authorities to trust.
 #### ca_file
 
 A PEM file with more certificate authorities to trust.
+
+#### certificate_file
+
+A PEM file with the client certificate, optionally followed by the intermediate
+certificates, sent when the server asks for one.
+
+#### key_password
+
+The password of an encrypted private key.
+
+#### private_key_file
+
+The PEM private key of `certificate_file`. Null reads it from `certificate_file`.
 
 #### verify
 

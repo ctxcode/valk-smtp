@@ -4,7 +4,7 @@ Sending email from [Valk](https://valk-lang.dev): an SMTP client with STARTTLS, 
 and a message builder that writes proper MIME — text and HTML bodies, attachments, and names and
 subjects in any language. Purely written in Valk, with no os-package dependencies.
 
-Requires Valk 0.7.0 or newer.
+Requires Valk 0.7.5 or newer.
 
 ## Install
 
@@ -118,9 +118,20 @@ tls: .{ ca_file: "/etc/ssl/mail.crt" }   // trust this authority as well
 tls: .{ verify: false }                  // check nothing, open to a machine in the middle
 ```
 
+A server that knows its clients by their certificate, such as a relay that trusts client
+certificates or a connector that identifies the sender by its certificate, gets one this way:
+
+```rust
+tls: .{
+    certificate_file: "/etc/ssl/relay.crt"
+    private_key_file: "/etc/ssl/relay.key"
+    key_password: ""                     // for an encrypted key
+}
+```
+
 After `STARTTLS` the client throws away what the server said before and asks again, and it
 refuses a server that sends anything between agreeing to `STARTTLS` and the handshake, since an
-attacker in the middle could have put it there. Client certificates are not supported.
+attacker in the middle could have put it there.
 
 ## Sending
 

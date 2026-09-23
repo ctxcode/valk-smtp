@@ -175,6 +175,12 @@ Namespaces: [main](#main)
     + ca_dir: ?String
     // A PEM file with more certificate authorities to trust.
     + ca_file: ?String
+    // A PEM file with the client certificate, optionally followed by the intermediate certificates, sent when the server asks for one.
+    + certificate_file: ?String
+    // The password of an encrypted private key.
+    + key_password: String
+    // The PEM private key of `certificate_file`. Null reads it from `certificate_file`.
+    + private_key_file: ?String
     // Whether the certificate of the server is checked.
     + verify: bool
 }

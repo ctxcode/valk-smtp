@@ -5,6 +5,11 @@ use valk.net
 // way its settings say, and records both sides of the conversation, so a test can assert the
 // exact exchange without any service running.
 
+// Raw OpenSSL calls that make the fake server ask for a client certificate, which valk.net has
+// no server-side setting for
+extern fn SSL_CTX_load_verify_locations(ctx: ptr, ca_file: ?cstring, ca_path: ?cstring) i32;
+extern fn SSL_CTX_set_verify(ctx: ptr, mode: i32, cb: ?ptr) void;
+
 // The certificate and key the fake server uses for TLS, made for localhost and 127.0.0.1 and
 // trusted by nothing but these tests
 fn test_cert() String {
@@ -22,6 +27,7 @@ class FakeServer {
     extensions: Array[String] (.{ "SIZE 1000000", "AUTH PLAIN LOGIN", "8BITMIME" })
     starttls: bool (false) // offer STARTTLS
     implicit_tls: bool (false) // TLS from the first byte
+    require_client_certificate: bool (false) // refuse a TLS client without the test certificate
     ehlo: bool (true) // false answers EHLO with 502, like a server that only knows HELO
     auth_ok: bool (true) // false answers the credentials with 535
     reject: Array[String] (.{}) // recipients answered with 550
@@ -33,6 +39,7 @@ class FakeServer {
     messages: Array[String] (.{}) // the DATA of each message, dots unstuffed
     raw_messages: Array[String] (.{}) // the DATA as it came, terminator included
     bare_newline: bool (false) // a line ended in a lone LF
+    client_certificate: String ("") // SHA-256 of the certificate the client sent
 
     // Both sides of the conversation, one line each, `C:` for the client and `S:` for the server
     fn transcript() String {
@@ -83,18 +90,29 @@ class LineSource {
     }
 }
 
-fn server_context() ?shared net.SslServerContext {
+fn server_context(require_client_certificate: bool) ?shared net.SslServerContext {
+    @unsafe
     let context: shared net.SslServerContext = net.SslServerContext.new(test_cert(), test_key()) ! return null
+    if require_client_certificate {
+        // The test certificate is its own authority
+        if SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), test_cert().data, null) != 1 : return null
+        SSL_CTX_set_verify(context.ctx.@cast(ptr), 3, null) // SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+    }
     return context
+}
+
+fn accept_tls(fake: FakeServer, con: net.TcpConnection) bool {
+    let context = server_context(fake.require_client_certificate) ?! return false
+    con.ssl_accept(context, 5000) ! return false
+    let ssl = con.ssl
+    if isset(ssl) : fake.client_certificate = ssl.peer_certificate_sha256() !? ""
+    return true
 }
 
 // Serves one connection and returns "ok", or what went wrong
 fn serve(fake: FakeServer) String {
     let con = fake.listener.accept(5000) ! return "accept failed"
-    if fake.implicit_tls {
-        let context = server_context() ?! return "no TLS context"
-        con.ssl_accept(context, 5000) ! return "TLS handshake failed"
-    }
+    if fake.implicit_tls && !accept_tls(fake, con) : return "TLS handshake failed"
     let source = LineSource { con: con }
     // No greeting at all: wait for the client to give up
     if fake.greeting.length == 0 {
@@ -132,8 +150,7 @@ fn serve(fake: FakeServer) String {
                 continue
             }
             fake.say(con, "220 2.0.0 Ready to start TLS")
-            let context = server_context() ?! return "no TLS context"
-            con.ssl_accept(context, 5000) ! return "TLS handshake failed"
+            if !accept_tls(fake, con) : return "TLS handshake failed"
             source = LineSource { con: con }
         } else if command.starts_with("AUTH PLAIN ") {
             fake.say(con, fake.auth_ok ? "235 2.7.0 Authentication successful" : "535 5.7.8 Error: authentication failed")
