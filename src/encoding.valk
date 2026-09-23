@@ -1,0 +1,209 @@
+use valk.crypto
+
+// Header lines are folded to stay within this many characters. RFC 5322 asks for 78, and
+// RFC 2047 for 76 on lines that carry encoded-words, so 76 serves both.
+value LINE_LIMIT (76)
+// Bytes of text per encoded-word: 52 base64 characters, 64 with the `=?utf-8?B?` and `?=`
+value WORD_BYTES (39)
+// The hard limit of RFC 5322 for any line, without its CRLF
+value MAX_LINE_LENGTH (998)
+
+// Writes `Name: token token ...`, folding before a token that would run past the line limit.
+// Tokens are joined by one space, which a fold turns into CRLF and a space.
+fn write_folded(out: ByteBuffer, name: String, tokens: Array[String]) {
+    out.write(name)
+    out.write_byte(':')
+    let column = name.length + 1
+    each tokens as token {
+        // A folded line may not be blank, so empty tokens (from double spaces) stay put
+        if token.length > 0 && column + 1 + token.length > LINE_LIMIT && column > 1 {
+            out.write("\r\n ")
+            column = 1
+        } else {
+            out.write_byte(' ')
+            column++
+        }
+        out.write(token)
+        column += token.length
+    }
+    out.write("\r\n")
+}
+
+// The tokens of free text such as a subject: its words when it is plain printable ASCII,
+// encoded-words otherwise
+fn text_tokens(text: String) Array[String] {
+    if needs_encoding(text) : return encoded_words(text)
+    let words = text.split(" ")
+    each words as word {
+        if word.length > MAX_LINE_LENGTH - 100 : return encoded_words(text)
+    }
+    return words
+}
+
+// Whether text has to travel as encoded-words: anything but printable ASCII, or something a
+// reader would take for an encoded-word
+fn needs_encoding(text: String) bool {
+    each text as ch {
+        if ch < 0x20 || ch > 0x7e : return true
+    }
+    return text.contains("=?")
+}
+
+// RFC 2047 encoded-words of UTF-8 text, split on character boundaries so that every word
+// decodes on its own
+fn encoded_words(text: String) Array[String] {
+    let words = Array[String]{}
+    let start: uint = 0
+    while start < text.length {
+        let end = start + WORD_BYTES
+        if end >= text.length {
+            end = text.length
+        } else {
+            // Step back to the first byte of a character
+            while end > start + 1 && (text[end] & 0xc0) == 0x80 {
+                end--
+            }
+        }
+        words.append("=?utf-8?B?" + crypto.base64_encode(text.view(start, end - start)) + "?=")
+        start = end
+    }
+    if words.length == 0 : words.append("=?utf-8?B??=")
+    return words
+}
+
+// Turns every line break, whether CRLF, LF or a lone CR, into CRLF
+fn normalize_newlines(text: String) String {
+    if !text.contains_byte('\n') && !text.contains_byte('\r') : return text
+    let out = ByteBuffer.new(text.length + text.length / 16)
+    let i: uint = 0
+    while i < text.length {
+        let ch = text[i++]
+        if ch == '\r' {
+            if i < text.length && text[i] == '\n' : i++
+            out.write("\r\n")
+        } else if ch == '\n' {
+            out.write("\r\n")
+        } else {
+            out.write_byte(ch)
+        }
+    }
+    return out.to_string()
+}
+
+// Whether text with CRLF line breaks can go as it is: ASCII without NUL, and no line longer
+// than the limit
+fn is_7bit(text: String) bool {
+    let column: uint = 0
+    each text as ch {
+        if ch == 0 || ch > 0x7f : return false
+        if ch == '\n' {
+            column = 0
+            continue
+        }
+        column++
+        if column > MAX_LINE_LENGTH : return false
+    }
+    return true
+}
+
+// Whether text is mostly bytes outside ASCII, which base64 carries in less space than
+// quoted-printable
+fn mostly_8bit(text: String) bool {
+    let high: uint = 0
+    each text as ch {
+        if ch > 0x7f : high++
+    }
+    return high * 4 > text.length
+}
+
+// Quoted-printable (RFC 2045) of text with CRLF line breaks, in lines of at most 76
+// characters
+fn quoted_printable(text: String) String {
+    let out = ByteBuffer.new(text.length + text.length / 4 + 16)
+    let column: uint = 0
+    let i: uint = 0
+    while i < text.length {
+        let ch = text[i]
+        if ch == '\r' && i + 1 < text.length && text[i + 1] == '\n' {
+            out.write("\r\n")
+            column = 0
+            i += 2
+            continue
+        }
+        let at_line_end = i + 1 >= text.length || (text[i + 1] == '\r' && i + 2 < text.length && text[i + 2] == '\n')
+        // Spaces at the end of a line would be stripped on the way, so they are escaped there
+        let literal = (ch >= 33 && ch <= 126 && ch != '=') || ((ch == ' ' || ch == '\t') && !at_line_end)
+        let width: uint = literal ? 1 : 3
+        // Room for the `=` of a soft break stays free
+        if column + width > 75 {
+            out.write("=\r\n")
+            column = 0
+        }
+        if literal {
+            out.write_byte(ch)
+        } else {
+            out.write_byte('=')
+            out.write_byte(hex_upper(ch >> 4))
+            out.write_byte(hex_upper(ch & 0x0f))
+        }
+        column += width
+        i++
+    }
+    return out.to_string()
+}
+
+fn hex_upper(value: u8) u8 {
+    if value < 10 : return '0' + value
+    return 'A' + (value - 10)
+}
+
+// Base64 in lines of 76 characters, each ended by CRLF
+fn write_base64_lines(out: ByteBuffer, data: String) {
+    let encoded = crypto.base64_encode(data)
+    let at: uint = 0
+    while at < encoded.length {
+        let take = encoded.length - at
+        if take > 76 : take = 76
+        out.write(encoded.view(at, take))
+        out.write("\r\n")
+        at += take
+    }
+}
+
+// A parameter value as a quoted-string
+fn quote(text: String) String {
+    let out = ByteBuffer.new(text.length + 2)
+    out.write_byte('"')
+    each text as ch {
+        if ch == '"' || ch == '\\' : out.write_byte('\\')
+        out.write_byte(ch)
+    }
+    out.write_byte('"')
+    return out.to_string()
+}
+
+// RFC 2231 extended parameter value: utf-8'' followed by the percent-encoded bytes
+fn rfc2231_value(text: String) String {
+    let out = ByteBuffer.new(text.length * 3 + 8)
+    out.write("utf-8''")
+    each text as ch {
+        let plain = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '_'
+        if plain {
+            out.write_byte(ch)
+        } else {
+            out.write_byte('%')
+            out.write_byte(hex_upper(ch >> 4))
+            out.write_byte(hex_upper(ch & 0x0f))
+        }
+    }
+    return out.to_string()
+}
+
+// Random text for boundaries and message ids
+fn random_hex(bytes: uint) String {
+    return crypto.hex_encode(crypto.random_bytes(bytes))
+}
+
+fn has_line_break(text: String) bool {
+    return text.contains_byte('\r') || text.contains_byte('\n')
+}

@@ -1,0 +1,237 @@
+use smtp
+
+fn simple_message() smtp.Message {
+    return smtp.Message {
+        from: "Ada <ada@example.com>"
+        to: .{ "bob@example.com" }
+        cc: .{ "Cid <cid@example.com>" }
+        bcc: .{ "dan@example.com" }
+        subject: "Hello"
+        text: "Hi Bob"
+    }
+}
+
+test "Protocol: one message" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    assert(client.greeting == "fake.test ESMTP ready")
+    assert(client.has_extension("size"))
+    assert((client.extensions.get("AUTH") !? "") == "PLAIN LOGIN")
+    assert(!client.tls_active)
+    assert(!client.authenticated)
+
+    let reply = client.send(simple_message()) ! { println(E.message) assert(false) return }
+    assert(reply == "2.0.0 Ok: queued as FAKE1")
+    client.close()
+    assert(client.closed)
+    assert(await running == "ok")
+
+    let size = fake.raw_messages.get(0) !? ""
+    let expected = "S: 220 fake.test ESMTP ready
+C: EHLO client.test
+S: 250-fake.test
+S: 250-SIZE 1000000
+S: 250-AUTH PLAIN LOGIN
+S: 250 8BITMIME
+C: MAIL FROM:<ada@example.com> SIZE=%{size.length}
+S: 250 2.1.0 Ok
+C: RCPT TO:<bob@example.com>
+S: 250 2.1.5 Ok
+C: RCPT TO:<cid@example.com>
+S: 250 2.1.5 Ok
+C: RCPT TO:<dan@example.com>
+S: 250 2.1.5 Ok
+C: DATA
+S: 354 End data with <CR><LF>.<CR><LF>
+C: <message>
+S: 250 2.0.0 Ok: queued as FAKE1
+C: QUIT
+S: 221 2.0.0 Bye"
+    assert(fake.transcript() == expected)
+    if fake.transcript() != expected : println(fake.transcript())
+    assert(!fake.bare_newline)
+
+    // Bcc gets the message but is nowhere in it
+    let data = fake.messages.get(0) !? ""
+    assert(data.contains("\r\nTo: bob@example.com\r\n"))
+    assert(data.contains("\r\nCc: Cid <cid@example.com>\r\n"))
+    assert(!data.contains("dan@example.com"))
+    assert(!data.contains("Bcc"))
+    assert(data.ends_with("\r\nHi Bob\r\n"))
+}
+
+test "Protocol: several messages over one connection" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    let first = smtp.Message { from: "a@example.com", to: .{ "b@example.com" }, subject: "One", text: "1" }
+    let second = smtp.Message { from: "a@example.com", to: .{ "c@example.com" }, subject: "Two", text: "2" }
+    client.send(first) ! { println(E.message) assert(false) return }
+    client.send(second) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+
+    let commands = Array[String]{}
+    each fake.lines as line {
+        if line.starts_with("C: ") : commands.append(line.range(3, line.length - 3).split(" ").get(0) !? "")
+    }
+    assert(commands.join(" ") == "EHLO MAIL RCPT DATA <message> RSET MAIL RCPT DATA <message> QUIT")
+    assert(fake.messages.length == 2)
+    assert((fake.messages.get(1) !? "").contains("Subject: Two"))
+}
+
+test "Protocol: dot-stuffing and the end of DATA" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    let text = ".starts with a dot\n..two dots\n.\nlast line"
+    let message = smtp.Message { from: "a@example.com", to: .{ "b@example.com" }, text: text }
+    client.send(message) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+
+    let raw = fake.raw_messages.get(0) !? ""
+    assert(raw.contains("\r\n..starts with a dot\r\n...two dots\r\n..\r\nlast line\r\n.\r\n"))
+    assert(raw.ends_with("\r\nlast line\r\n.\r\n"))
+    // What arrives is the text again, with CRLF line breaks
+    let data = fake.messages.get(0) !? ""
+    assert(data.ends_with("\r\n\r\n.starts with a dot\r\n..two dots\r\n.\r\nlast line\r\n"))
+    assert(!fake.bare_newline)
+}
+
+test "Protocol: send_raw fixes line breaks and stuffs dots" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    // Bare LF and CR, and a lone dot line that would end DATA early
+    let data = "Subject: raw\n\nline one\r.\nline two\n.\nend"
+    client.send_raw("bounce@example.com", .{ "x@example.com", "Y <y@example.com>" }, data) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+
+    assert(fake.transcript().contains("C: MAIL FROM:<bounce@example.com> SIZE="))
+    assert(fake.transcript().contains("C: RCPT TO:<x@example.com>\n"))
+    assert(fake.transcript().contains("C: RCPT TO:<y@example.com>\n"))
+    assert((fake.raw_messages.get(0) !? "") == "Subject: raw\r\n\r\nline one\r\n..\r\nline two\r\n..\r\nend\r\n.\r\n")
+    assert(!fake.bare_newline)
+}
+
+test "Protocol: AUTH PLAIN" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.allow_insecure_auth = true
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    assert(client.authenticated)
+    client.close()
+    assert(await running == "ok")
+    assert(fake.transcript().contains("\nC: AUTH PLAIN AGFkYUBleGFtcGxlLmNvbQBzZWNyZXQ=\nS: 235 2.7.0 Authentication successful\nC: QUIT\n"))
+}
+
+test "Protocol: AUTH LOGIN" {
+    let fake = fake_server()
+    fake.extensions = .{ "AUTH LOGIN" }
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.allow_insecure_auth = true
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    assert(client.authenticated)
+    client.close()
+    assert(await running == "ok")
+    let expected = "C: AUTH LOGIN
+S: 334 VXNlcm5hbWU6
+C: YWRhQGV4YW1wbGUuY29t
+S: 334 UGFzc3dvcmQ6
+C: c2VjcmV0
+S: 235 2.7.0 Authentication successful
+C: QUIT"
+    assert(fake.transcript().contains(expected))
+}
+
+test "Protocol: a chosen login mechanism wins" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.allow_insecure_auth = true
+    config.auth = smtp.AuthMethod.login
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+    assert(fake.transcript().contains("C: AUTH LOGIN\n"))
+}
+
+test "Protocol: HELO for a server without EHLO" {
+    let fake = fake_server()
+    fake.ehlo = false
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    assert(client.extensions.length == 0)
+    client.send(simple_message()) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+    let transcript = fake.transcript()
+    assert(transcript.contains("C: EHLO client.test\nS: 502 5.5.2 Error: command not recognized\nC: HELO client.test\nS: 250 fake.test\n"))
+    // Without the SIZE extension there is no SIZE parameter
+    assert(transcript.contains("C: MAIL FROM:<ada@example.com>\n"))
+}
+
+test "Protocol: multi-line EHLO extensions" {
+    let fake = fake_server()
+    fake.extensions = .{ "PIPELINING", "SIZE 20", "AUTH=LOGIN", "AUTH PLAIN XOAUTH2", "ENHANCEDSTATUSCODES", "SMTPUTF8" }
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    assert(client.extensions.length == 5)
+    assert(client.has_extension("PIPELINING"))
+    assert(client.has_extension("smtputf8"))
+    assert((client.extensions.get("SIZE") !? "") == "20")
+    // `AUTH=` is the old spelling; the proper line wins
+    assert((client.extensions.get("AUTH") !? "") == "PLAIN XOAUTH2")
+
+    // SIZE 20 is less than any message
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, rejected))
+        assert(E.message.contains("at most 20"))
+    }
+    client.close()
+    assert(await running == "ok")
+    assert(!fake.transcript().contains("MAIL FROM"))
+}
+
+test "Protocol: the address of this end introduces the client" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.helo_name = ""
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+    assert(fake.transcript().contains("C: EHLO [127.0.0.1]\n"))
+}
+
+test "Protocol: NOOP" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    assert(client.ping())
+    client.close()
+    assert(!client.ping())
+    assert(await running == "ok")
+    assert(fake.transcript().contains("C: NOOP\nS: 250 2.0.0 Ok\nC: QUIT"))
+}
+
+test "Protocol: one call to send" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let reply = smtp.send(fake_config(fake), simple_message()) ! { println(E.message) assert(false) return }
+    assert(reply == "2.0.0 Ok: queued as FAKE1")
+    assert(await running == "ok")
+    assert(fake.messages.length == 1)
+    assert(fake.transcript().ends_with("C: QUIT\nS: 221 2.0.0 Bye"))
+}

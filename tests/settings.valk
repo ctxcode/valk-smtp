@@ -1,0 +1,72 @@
+use smtp
+
+test "Settings: usual ports" {
+    let config = smtp.Config {}
+    assert(config.host == "localhost")
+    assert(config.security == smtp.Security.starttls)
+    assert(config.port_or_default() == 587)
+    config.security = smtp.Security.tls
+    assert(config.port_or_default() == 465)
+    config.security = smtp.Security.plain
+    assert(config.port_or_default() == 25)
+    config.port = 2525
+    assert(config.port_or_default() == 2525)
+    assert(config.tls.verify)
+}
+
+test "Settings: from a URL" {
+    let plain = smtp.config_from_url("smtp://mail.example.com") ! { println(E.message) assert(false) return }
+    assert(plain.host == "mail.example.com")
+    assert(plain.security == smtp.Security.starttls)
+    assert(plain.port_or_default() == 587)
+    assert(plain.username == "" && plain.password == "")
+
+    let full = smtp.config_from_url("smtps://ada\%40example.com:p\%40ss\%3Aword@smtp.example.com:2465", 1000) ! { println(E.message) assert(false) return }
+    assert(full.security == smtp.Security.tls)
+    assert(full.host == "smtp.example.com")
+    assert(full.port == 2465)
+    assert(full.username == "ada@example.com")
+    assert(full.password == "p@ss:word")
+    assert(full.timeout_ms == 1000)
+
+    let query = smtp.config_from_url("smtp://[::1]:1025?security=plain&auth=login&helo_name=me.example.com&allow_insecure_auth=true&verify=false") ! { println(E.message) assert(false) return }
+    assert(query.host == "::1")
+    assert(query.port == 1025)
+    assert(query.security == smtp.Security.plain)
+    assert(query.auth == smtp.AuthMethod.login)
+    assert(query.helo_name == "me.example.com")
+    assert(query.allow_insecure_auth)
+    assert(!query.tls.verify)
+
+    let optional = smtp.config_from_url("smtp://localhost?security=starttls_optional") ! { assert(false) return }
+    assert(optional.security == smtp.Security.starttls_optional)
+
+    let bad = Array[String]{
+        "http://example.com",
+        "smtp://example.com?security=maybe",
+        "smtp://example.com?auth=cram-md5",
+        "smtp://example.com?colour=blue",
+        "smtp://example.com?verify",
+        "smtp://example.com:99999",
+    }
+    let refused: uint = 0
+    each bad as text {
+        smtp.config_from_url(text) ! {
+            if error_is(E.code, invalid) : refused++
+            continue
+        }
+        println("accepted: " + text)
+    }
+    assert(refused == bad.length)
+}
+
+test "Settings: a name to introduce the client with" {
+    let fake = fake_server()
+    let config = fake_config(fake)
+    config.helo_name = "client.test\r\nMAIL FROM:<x@example.com>"
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, invalid))
+        return
+    }
+    assert(false)
+}

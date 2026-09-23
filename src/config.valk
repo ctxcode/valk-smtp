@@ -1,0 +1,138 @@
+use valk.url
+
+/// How the connection is protected with TLS.
++ enum Security {
+    /// No TLS: everything, the password too, crosses the network as it is. For a relay on the
+    /// same machine or a test server.
+    plain
+    /// Connect in plain text and switch to TLS with `STARTTLS` before anything else is sent,
+    /// failing when the server does not offer it. Usually port 587. The default.
+    starttls
+    /// Switch to TLS with `STARTTLS` when the server offers it and go on without it when not.
+    /// A machine in the middle can hide the offer, so this only guards against listening in.
+    starttls_optional
+    /// TLS from the first byte, also called SMTPS or implicit TLS. Usually port 465.
+    tls
+}
+
+/// How to log in.
++ enum AuthMethod {
+    /// The first of `PLAIN` and `LOGIN` that the server offers.
+    auto
+    /// `AUTH PLAIN`, whether the server announces it or not.
+    plain
+    /// `AUTH LOGIN`, whether the server announces it or not.
+    login
+}
+
+/// TLS settings for a connection.
+///
+/// The defaults verify the server certificate against the system CA bundle, which is what a
+/// mail provider with a certificate from a public CA needs. A server with a self-signed
+/// certificate needs its certificate in `ca_file`, or `verify: false` to check nothing, which
+/// leaves the connection open to a machine in the middle.
+///
+/// The certificate is checked against the host that was connected to. Client certificates are
+/// not supported.
++ class TlsOptions {
+    /// Whether the certificate of the server is checked.
+    + verify: bool (true)
+    /// A PEM file with more certificate authorities to trust.
+    + ca_file: ?String (null)
+    /// A directory of more certificate authorities to trust.
+    + ca_dir: ?String (null)
+}
+
+/// Everything needed to open a connection.
+///
+/// `connect` builds one of these, and `connect_with` and `send` take one. It holds the
+/// password, so keep it out of logs.
++ class Config {
+    /// Host name or address of the server.
+    + host: String ("localhost")
+    /// Port of the server; 0 picks the usual one for `security`: 25 for `plain`, 587 for
+    /// `starttls` and `starttls_optional`, 465 for `tls`.
+    + port: u16 (0)
+    /// How the connection is protected.
+    + security: Security (Security.starttls)
+    /// The user name to log in with, or "" to send without logging in.
+    + username: String ("")
+    /// The password to log in with.
+    + password: String ("")
+    /// The login mechanism.
+    + auth: AuthMethod (AuthMethod.auto)
+    /// Allows logging in over a connection without TLS. Leave it off unless the network in
+    /// between is trusted, such as a relay on the same machine.
+    + allow_insecure_auth: bool (false)
+    /// The name this client introduces itself with in `EHLO`. Empty sends the address of this
+    /// end of the connection, as `[192.0.2.1]`.
+    + helo_name: String ("")
+    /// How long connecting may take, and how long any one reply may take, in milliseconds.
+    + timeout_ms: uint (30000)
+    /// TLS settings, used by every security mode but `plain`.
+    + tls: TlsOptions (TlsOptions {})
+
+    /// Returns `port`, or the usual port of `security` when it is 0.
+    + fn port_or_default() u16 {
+        if this.port > 0 : return this.port
+        if this.security == Security.plain : return 25
+        if this.security == Security.tls : return 465
+        return 587
+    }
+}
+
+/// Reads an `smtp://` or `smtps://` URL as a `Config`.
+///
+/// `smtps://` is TLS from the first byte and `smtp://` switches to TLS with `STARTTLS`, which
+/// the server has to offer. The URL may carry the credentials:
+/// `smtp://user%40example.com:secret@smtp.example.com:587`. The query string can set
+/// `security` (`plain`, `starttls`, `starttls_optional` or `tls`), `verify=false`,
+/// `auth` (`plain` or `login`), `helo_name` and `allow_insecure_auth=true`.
+///
+/// ```valk
+/// let config = smtp.config_from_url("smtp://localhost:1025?security=plain") ! panic("%{E.message}")
+/// ```
++ fn config_from_url(text: String, timeout_ms: uint (30000)) Config !Error {
+    let parts = url.parse(text)
+    let config = Config { timeout_ms: timeout_ms }
+    if parts.scheme == "smtps" : config.security = Security.tls
+    else if parts.scheme != "smtp" {
+        throw .invalid { message: "'" + parts.scheme + "' is not an smtp:// or smtps:// URL" }
+    }
+    if parts.host.length > 0 : config.host = parts.host.trim("[").trim("]")
+    let port = parts.port
+    if isset(port) {
+        if port > 65535 : throw .invalid { message: "The port in the URL is out of range" }
+        config.port = port.to(u16)
+    }
+    config.username = url.decode(parts.user)
+    config.password = url.decode(parts.password)
+
+    if parts.query.length == 0 : return config
+    each parts.query.split("&") as pair {
+        let split = pair.index_of_byte('=') ! throw .invalid { message: "'" + pair + "' in the URL has no value" }
+        let key = pair.range(0, split)
+        let value = url.decode(pair.range(split + 1, pair.length - split - 1))
+        if key == "security" {
+            if value == "plain" : config.security = Security.plain
+            else if value == "starttls" : config.security = Security.starttls
+            else if value == "starttls_optional" : config.security = Security.starttls_optional
+            else if value == "tls" : config.security = Security.tls
+            else : throw .invalid { message: "'" + value + "' is not a security mode" }
+        } else if key == "verify" {
+            config.tls.verify = value != "false" && value != "0"
+        } else if key == "auth" {
+            if value == "plain" : config.auth = AuthMethod.plain
+            else if value == "login" : config.auth = AuthMethod.login
+            else if value == "auto" : config.auth = AuthMethod.auto
+            else : throw .invalid { message: "'" + value + "' is not a login mechanism" }
+        } else if key == "helo_name" {
+            config.helo_name = value
+        } else if key == "allow_insecure_auth" {
+            config.allow_insecure_auth = value == "true" || value == "1"
+        } else {
+            throw .invalid { message: "'" + key + "' is not a setting of an SMTP URL" }
+        }
+    }
+    return config
+}

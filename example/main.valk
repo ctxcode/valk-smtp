@@ -1,0 +1,28 @@
+use smtp
+
+// Run `make server` first to see the message arrive in Mailpit at http://localhost:8525
+value MAILPIT_URL ("smtp://localhost:2525?security=plain")
+
+fn main() {
+    let message = smtp.Message {
+        from: "Ada Lovelace <ada@example.com>"
+        to: .{ "Charles Babbage <charles@example.com>" }
+        bcc: .{ "archive@example.com" }
+        subject: "Notes on the Analytical Engine — draft ✍"
+        text: "Charles,\n\nThe notes are attached. The engine might compose music.\n\nAda"
+        html: "<p>Charles,</p><p>The notes are attached. The engine might <em>compose music</em>.</p><p>Ada</p>"
+    }
+    message.attach("notes.txt", "text/plain", "Note G: the Bernoulli numbers.\n")
+
+    // What goes over the wire
+    let rendered = message.render() ! panic("Cannot render: %{E.message}")
+    println(rendered)
+
+    // Sending it: one call that connects, sends and says goodbye
+    let config = smtp.config_from_url(MAILPIT_URL) ! panic("%{E.message}")
+    let reply = smtp.send(config, message) ! {
+        println("Not sent (%{E.message}); start Mailpit with `make server` to try it")
+        return
+    }
+    println("Sent: " + reply)
+}

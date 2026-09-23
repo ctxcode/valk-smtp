@@ -1,0 +1,271 @@
+use smtp
+use valk.core
+use valk.crypto
+use valk.http
+use valk.json
+use valk.time
+
+// Integration tests against the Mailpit servers of tests/server.sh (`make server`). Every test
+// here is named "Mailpit: ...", so `make test-mailpit` runs them alone, and SKIP_MAILPIT=1
+// skips them where docker is not at hand.
+
+value MAILPIT_SMTP (2525) // plain, with STARTTLS on offer
+value MAILPIT_API (8525)
+value MAILPIT_TLS_SMTP (2465) // TLS from the first byte
+value MAILPIT_TLS_API (8526)
+
+// The certificate tests/server.sh generated for both servers
+fn mailpit_cert() String {
+    return __DIR__ + "/certs/server.crt"
+}
+
+fn skip_mailpit() bool {
+    return (core.getenv("SKIP_MAILPIT") !? "") == "1"
+}
+
+// Whether both servers answer. The tests that need them return early when they do not, and
+// "Mailpit: the servers are running" fails with the reason instead.
+fn mailpit_up() bool {
+    if skip_mailpit() : return false
+    let plain = http.get("http://127.0.0.1:%{MAILPIT_API}/api/v1/info", http.Options { timeout_ms: 2000 }) ! return false
+    let tls = http.get("http://127.0.0.1:%{MAILPIT_TLS_API}/api/v1/info", http.Options { timeout_ms: 2000 }) ! return false
+    return plain.status == 200 && tls.status == 200
+}
+
+test "Mailpit: the servers are running" {
+    if skip_mailpit() {
+        println("Skipped the Mailpit tests: SKIP_MAILPIT=1")
+        return
+    }
+    let up = mailpit_up()
+    if !up : println("Mailpit is not running on 127.0.0.1:%{MAILPIT_API} and :%{MAILPIT_TLS_API}. Start it with `make server`, or skip these tests with SKIP_MAILPIT=1.")
+    assert(up)
+}
+
+// A word no other message has, to find this one by
+fn unique_token() String {
+    return crypto.hex_encode(crypto.random_bytes(8))
+}
+
+// Finds the message whose subject holds `token` and returns what Mailpit knows of it
+fn mailpit_message(api_port: uint, token: String) json.Value {
+    let tries: uint = 0
+    while tries++ < 50 {
+        let found = http.get("http://127.0.0.1:%{api_port}/api/v1/search?query=subject:" + token) ! break
+        let list = json.decode(found.body) ! break
+        if list["messages_count"].int == 1 {
+            let id = list["messages"][0]["ID"].string
+            let detail = http.get("http://127.0.0.1:%{api_port}/api/v1/message/" + id) ! break
+            let message = json.decode(detail.body) ! break
+            return message
+        }
+        time.sleep_ms(100)
+    }
+    println("Mailpit has no message with '" + token + "' in its subject")
+    return json.new_null()
+}
+
+// The bytes of one attachment
+fn mailpit_part(api_port: uint, message: json.Value, part_id: String) String {
+    let response = http.get("http://127.0.0.1:%{api_port}/api/v1/message/" + message["ID"].string + "/part/" + part_id) ! return ""
+    return response.body
+}
+
+fn addresses(list: json.Value) String {
+    let result = Array[String]{}
+    let i: uint = 0
+    while i < list.length {
+        let name = list[i]["Name"].string
+        let address = list[i]["Address"].string
+        result.append(name.length > 0 ? name + " <" + address + ">" : address)
+        i++
+    }
+    return result.join(", ")
+}
+
+fn every_byte() String {
+    let bytes = ByteBuffer.new()
+    let i: uint = 0
+    while i < 1000 {
+        bytes.write_byte((i * 7 % 256).to(u8))
+        i++
+    }
+    return bytes.to_string()
+}
+
+test "Mailpit: plain SMTP" {
+    if !mailpit_up() : return
+    let token = unique_token()
+    let message = smtp.Message {
+        from: "Ada Lovelace <ada@example.com>"
+        to: .{ "Charles Babbage <charles@example.com>", "mary@example.com" }
+        cc: .{ "Cid <cid@example.com>" }
+        bcc: .{ "hidden@example.com" }
+        reply_to: "replies@example.com"
+        subject: "Plain " + token
+        text: "Hello Charles,\n\nThe numbers are attached.\n.\n..and a line with dots.\n"
+        html: "<p>Hello Charles,</p><p>The numbers are <b>attached</b>.</p>"
+    }
+    message.headers.set("X-Mailer-Test", token)
+    let data = every_byte()
+    message.attach("numbers.bin", "application/octet-stream", data)
+    message.attach("notes.csv", "text/csv", "a,b\n1,2\n")
+
+    let client = smtp.connect("127.0.0.1", MAILPIT_SMTP, smtp.Security.plain) ! { println(E.message) assert(false) return }
+    assert(!client.tls_active)
+    assert(client.has_extension("STARTTLS"))
+    let reply = client.send(message) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(reply.contains("queued"))
+
+    let received = mailpit_message(MAILPIT_API, token)
+    assert(received["Subject"].string == "Plain " + token)
+    assert(received["From"]["Name"].string == "Ada Lovelace")
+    assert(received["From"]["Address"].string == "ada@example.com")
+    assert(addresses(received["To"]) == "Charles Babbage <charles@example.com>, mary@example.com")
+    assert(addresses(received["Cc"]) == "Cid <cid@example.com>")
+    // Bcc went by the envelope only; Mailpit lists who got it without being in the headers
+    assert(addresses(received["Bcc"]) == "hidden@example.com")
+    assert(addresses(received["ReplyTo"]) == "replies@example.com")
+    assert(received["MessageID"].string == message.message_id.trim("<").trim(">"))
+    assert(received["Text"].string.replace("\r\n", "\n") == message.text)
+    assert(received["HTML"].string == message.html)
+
+    let files = received["Attachments"]
+    assert(files.length == 2)
+    assert(files[0]["FileName"].string == "numbers.bin")
+    assert(files[0]["ContentType"].string == "application/octet-stream")
+    assert(files[0]["Size"].int == 1000)
+    assert(files[0]["Checksums"]["SHA256"].string == crypto.sha256_hex(data))
+    assert(mailpit_part(MAILPIT_API, received, files[0]["PartID"].string) == data)
+    assert(files[1]["FileName"].string == "notes.csv")
+    assert(files[1]["ContentType"].string == "text/csv")
+    assert(mailpit_part(MAILPIT_API, received, files[1]["PartID"].string) == "a,b\n1,2\n")
+
+    // The raw source shows the headers as they went, Bcc left out. Mailpit puts headers of its
+    // own in front, a Bcc from the envelope among them, so what was sent starts at the Date.
+    let source = http.get("http://127.0.0.1:%{MAILPIT_API}/api/v1/message/" + received["ID"].string + "/raw") ! { assert(false) return }
+    let sent_at = source.body.index_of("\nDate: ") ! { assert(false) return }
+    let sent = source.body.range(sent_at, source.body.length - sent_at)
+    assert(sent.contains("\nX-Mailer-Test: " + token + "\r\n"))
+    assert(!sent.contains("hidden@example.com"))
+}
+
+test "Mailpit: STARTTLS with AUTH PLAIN" {
+    if !mailpit_up() : return
+    let token = unique_token()
+    let client = smtp.connect_with(smtp.Config {
+        host: "localhost"
+        port: MAILPIT_SMTP
+        security: smtp.Security.starttls
+        username: "ada@example.com"
+        password: "secret"
+        tls: .{ ca_file: mailpit_cert() }
+    }) ! { println(E.message) assert(false) return }
+    assert(client.tls_active)
+    assert(client.authenticated)
+    let message = smtp.Message {
+        from: "ada@example.com"
+        to: .{ "bob@example.com" }
+        subject: "STARTTLS " + token
+        text: "Sent over STARTTLS"
+    }
+    client.send(message) ! { println(E.message) assert(false) return }
+    client.close()
+
+    let received = mailpit_message(MAILPIT_API, token)
+    assert(received["Subject"].string == "STARTTLS " + token)
+    // Mailpit records who logged in
+    assert(received["Username"].string == "ada@example.com")
+    assert(received["Text"].string.trim("\r\n") == "Sent over STARTTLS")
+}
+
+test "Mailpit: implicit TLS with AUTH LOGIN" {
+    if !mailpit_up() : return
+    let token = unique_token()
+    let config = smtp.config_from_url("smtps://bob\%40example.com:hunter2@localhost:%{MAILPIT_TLS_SMTP}?auth=login") ! { println(E.message) assert(false) return }
+    config.tls.ca_file = mailpit_cert()
+    let message = smtp.Message {
+        from: "Bob <bob@example.com>"
+        to: .{ "Ada <ada@example.com>" }
+        subject: "TLS " + token
+        html: "<h1>Over TLS</h1>"
+    }
+    message.attach("hello.txt", "text/plain", "hello over TLS")
+    let reply = smtp.send(config, message) ! { println(E.message) assert(false) return }
+    assert(reply.length > 0)
+
+    let received = mailpit_message(MAILPIT_TLS_API, token)
+    assert(received["Subject"].string == "TLS " + token)
+    assert(received["Username"].string == "bob@example.com")
+    assert(received["HTML"].string == "<h1>Over TLS</h1>")
+    let files = received["Attachments"]
+    assert(files.length == 1)
+    assert(mailpit_part(MAILPIT_TLS_API, received, files[0]["PartID"].string) == "hello over TLS")
+}
+
+test "Mailpit: text outside ASCII" {
+    if !mailpit_up() : return
+    let token = unique_token()
+    let long_line = "Lorem ipsum ".pad_right('x', 1500)
+    let message = smtp.Message {
+        from: "Zoë Ångström <zoe@example.com>"
+        to: .{ "Jürgen Müller <juergen@example.com>" }
+        subject: "Grüße, 日本語 und ✓ " + token
+        text: "Grüße aus Köln — café, crème brûlée.\n" + long_line + "\n"
+        html: "<p>日本語のテキストです。これは長い文章です。</p>"
+    }
+    message.attach("Übersicht März.txt", "text/plain", "Inhalt")
+    smtp.send(smtp.Config { host: "127.0.0.1", port: MAILPIT_SMTP, security: smtp.Security.plain }, message) ! { println(E.message) assert(false) return }
+
+    let received = mailpit_message(MAILPIT_API, token)
+    assert(received["Subject"].string == message.subject)
+    assert(received["From"]["Name"].string == "Zoë Ångström")
+    assert(received["To"][0]["Name"].string == "Jürgen Müller")
+    assert(received["Text"].string.replace("\r\n", "\n") == message.text)
+    assert(received["HTML"].string == message.html)
+    assert(received["Attachments"][0]["FileName"].string == "Übersicht März.txt")
+}
+
+test "Mailpit: several messages over one connection" {
+    if !mailpit_up() : return
+    let token = unique_token()
+    let client = smtp.connect("127.0.0.1", MAILPIT_SMTP, smtp.Security.plain) ! { println(E.message) assert(false) return }
+    let i: uint = 0
+    while i < 3 {
+        let message = smtp.Message {
+            from: "ada@example.com"
+            to: .{ "bob@example.com" }
+            subject: "Batch " + token + "n" + i
+            text: "Message " + i
+        }
+        client.send(message) ! { println(E.message) assert(false) return }
+        i++
+    }
+    client.close()
+    i = 0
+    while i < 3 {
+        let received = mailpit_message(MAILPIT_API, token + "n" + i)
+        assert(received["Text"].string.trim("\r\n") == "Message " + i)
+        i++
+    }
+}
+
+test "Mailpit: an untrusted certificate is refused" {
+    if !mailpit_up() : return
+    smtp.connect("localhost", MAILPIT_TLS_SMTP, smtp.Security.tls) ! {
+        assert(error_is(E.code, tls))
+        return
+    }
+    assert(false)
+}
+
+test "Mailpit: a TLS port does not speak plain SMTP" {
+    if !mailpit_up() : return
+    // The server waits for a TLS handshake and the client for a greeting
+    smtp.connect("127.0.0.1", MAILPIT_TLS_SMTP, smtp.Security.plain, "", "", 1000) ! {
+        assert(error_is(E.code, timeout) || error_is(E.code, closed) || error_is(E.code, protocol))
+        return
+    }
+    assert(false)
+}

@@ -1,0 +1,368 @@
+use smtp
+use valk.crypto
+use valk.fs
+use valk.time
+
+// Whether text is what may go over the wire: ASCII, CRLF line breaks only, no line longer
+// than 998 characters
+fn wire_safe(text: String) bool {
+    let column: uint = 0
+    let i: uint = 0
+    while i < text.length {
+        let ch = text[i]
+        if ch == '\r' {
+            if i + 1 >= text.length || text[i + 1] != '\n' : return false
+            column = 0
+            i += 2
+            continue
+        }
+        if ch == '\n' || ch > 0x7f : return false
+        column++
+        if column > 998 : return false
+        i++
+    }
+    return true
+}
+
+// The longest line, without its CRLF
+fn longest_line(text: String) uint {
+    let longest: uint = 0
+    each text.split("\r\n") as line {
+        if line.length > longest : longest = line.length
+    }
+    return longest
+}
+
+// The header block, with folded lines joined again
+fn headers_of(rendered: String) String {
+    let end = rendered.index_of("\r\n\r\n") !? rendered.length
+    return rendered.range(0, end + 2).replace("\r\n ", " ")
+}
+
+fn render(message: smtp.Message) String {
+    return message.render() ! {
+        println("render: " + E.message)
+        return ""
+    }
+}
+
+fn basic() smtp.Message {
+    return smtp.Message {
+        from: "Ada Lovelace <ada@example.com>"
+        to: .{ "bob@example.com", "Cid Moreau <cid@example.com>" }
+        cc: .{ "dan@example.com" }
+        bcc: .{ "Secret Keeper <eve@example.com>" }
+        reply_to: "replies@example.com"
+        subject: "Quarterly numbers"
+        text: "Hello\nworld"
+        date: time.DateTime.new(2026, 9, 22, 14, 7, 9) !? null
+    }
+}
+
+test "Rendering: headers" {
+    let message = basic()
+    message.headers.set("X-Priority", "1")
+    message.headers.set("List-Unsubscribe", "<mailto:unsubscribe@example.com>")
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+
+    let expected = "Date: Tue, 22 Sep 2026 14:07:09 +0000\r
+From: Ada Lovelace <ada@example.com>\r
+To: bob@example.com, Cid Moreau <cid@example.com>\r
+Cc: dan@example.com\r
+Reply-To: replies@example.com\r
+Subject: Quarterly numbers\r
+Message-ID: " + message.message_id + "\r
+"
+    assert(rendered.starts_with(expected))
+    let headers = headers_of(rendered)
+    assert(headers.contains("\r\nX-Priority: 1\r\n"))
+    assert(headers.contains("\r\nList-Unsubscribe: <mailto:unsubscribe@example.com>\r\n"))
+    assert(headers.contains("\r\nMIME-Version: 1.0\r\n"))
+    assert(headers.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"))
+    assert(headers.contains("\r\nContent-Transfer-Encoding: 7bit\r\n"))
+    assert(rendered.ends_with("\r\n\r\nHello\r\nworld\r\n"))
+
+    // Bcc receives the message and appears nowhere in it
+    assert(!rendered.contains("eve@example.com"))
+    assert(!rendered.contains("Secret Keeper"))
+    assert(!headers.lower().contains("\r\nbcc:"))
+    let recipients = message.recipients() ! { assert(false) return }
+    assert(recipients.join(",") == "bob@example.com,cid@example.com,dan@example.com,eve@example.com")
+}
+
+test "Rendering: message id and date" {
+    let message = basic()
+    message.date = null
+    let rendered = render(message)
+    // A made up id, kept for the next render
+    let id = message.message_id
+    assert(id.starts_with("<") && id.ends_with("@example.com>"))
+    assert(id.length == 32 + 14)
+    assert(render(message).contains("\r\nMessage-ID: " + id + "\r\n"))
+    // The date is now, in RFC 5322 form
+    let date_line = rendered.range(0, rendered.index_of("\r\n") !? 0)
+    assert(date_line.ends_with(" +0000"))
+    assert(date_line.length == "Date: Tue, 22 Sep 2026 14:07:09 +0000".length)
+
+    let dated = time.DateTime.new(2000, 2, 29, 23, 59, 58) ! { assert(false) return }
+    assert(smtp.format_date(dated) == "Tue, 29 Feb 2000 23:59:58 +0000")
+
+    let own = basic()
+    own.message_id = "<order-17@shop.example.com>"
+    assert(render(own).contains("\r\nMessage-ID: <order-17@shop.example.com>\r\n"))
+    own.message_id = "order-17"
+    own.render() ! { assert(error_is(E.code, invalid)) }
+    own.message_id = "<a@b>\r\nBcc: x@example.com"
+    own.render() ! { assert(error_is(E.code, invalid)) }
+}
+
+test "Rendering: encoded-words" {
+    let message = basic()
+    message.subject = "Grüße aus Köln"
+    message.from = "Zoë Ångström <zoe@example.com>"
+    message.to = .{ "Lovelace, Ada <ada@example.com>", "\"Quoted \\\"Name\\\"\" <q@example.com>" }
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    let headers = headers_of(rendered)
+    assert(headers.contains("\r\nSubject: =?utf-8?B?R3LDvMOfZSBhdXMgS8O2bG4=?=\r\n"))
+    assert(headers.contains("\r\nFrom: =?utf-8?B?Wm/DqyDDhW5nc3Ryw7Zt?= <zoe@example.com>\r\n"))
+    assert(headers.contains("\r\nTo: \"Lovelace, Ada\" <ada@example.com>, \"Quoted \\\"Name\\\"\" <q@example.com>\r\n"))
+
+    // Text that only looks like an encoded-word is encoded, so it cannot pose as one
+    message.subject = "=?utf-8?B?SGk=?="
+    assert(headers_of(render(message)).contains("\r\nSubject: =?utf-8?B?PT91dGYtOD9CP1NHaz0/PQ==?=\r\n"))
+}
+
+test "Rendering: long headers fold" {
+    let message = basic()
+    let words = Array[String]{}
+    let i: uint = 0
+    while i++ < 60 : words.append("word" + i)
+    message.subject = words.join(" ")
+    let many = Array[String]{}
+    i = 0
+    while i++ < 30 : many.append("Person " + i + " <person" + i + "@example.com>")
+    message.to = many
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    let raw_headers = rendered.range(0, rendered.index_of("\r\n\r\n") !? 0)
+    assert(longest_line(raw_headers) <= 76)
+    // Unfolded, the values are what went in
+    let headers = headers_of(rendered)
+    assert(headers.contains("\r\nSubject: " + message.subject + "\r\n"))
+    assert(headers.contains("\r\nTo: " + many.join(", ") + "\r\n"))
+
+    // Non-ASCII text runs over several encoded-words, each at most 75 characters, split
+    // between characters rather than inside one
+    let long = "Überprüfung der Übersetzungen für die nächste Veröffentlichung — ganz dringend, bitte bis Freitag"
+    message.subject = long
+    let encoded = render(message)
+    let subject_start = encoded.index_of("\r\nSubject: ") !? 0
+    let subject_end = encoded.index_of("\r\n", subject_start + 2) !? 0
+    while encoded[subject_end + 2] == ' ' : subject_end = encoded.index_of("\r\n", subject_end + 2) !? 0
+    let subject = encoded.range(subject_start + 2, subject_end - subject_start - 2)
+    assert(longest_line(subject) <= 76)
+    let decoded = ByteBuffer.new()
+    each subject.range(9, subject.length - 9).replace("\r\n ", " ").split(" ") as word {
+        assert(word.length <= 75 && word.starts_with("=?utf-8?B?") && word.ends_with("?="))
+        let piece = crypto.base64_decode(word.range(10, word.length - 12)) ! { assert(false) return }
+        // Every word holds whole characters
+        assert(piece.length > 0 && (piece[0] & 0xc0) != 0x80)
+        decoded.write(piece)
+    }
+    assert(decoded.to_string() == long)
+
+    // A single word too long for any line
+    message.subject = "x".pad_right('x', 3000)
+    let very_long = render(message)
+    assert(wire_safe(very_long))
+    assert(longest_line(very_long.range(0, very_long.index_of("\r\n\r\n") !? 0)) <= 76)
+}
+
+test "Rendering: text and HTML are alternatives" {
+    let message = basic()
+    message.html = "<p>Hello <b>world</b></p>"
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    let headers = headers_of(rendered)
+    assert(headers.contains("\r\nContent-Type: multipart/alternative; boundary=\"=_"))
+    let at = rendered.index_of("boundary=\"") !? 0
+    let boundary = rendered.range(at + 10, 34)
+    assert(boundary.starts_with("=_"))
+    let expected = "\r\n\r\n--" + boundary + "\r
+Content-Type: text/plain; charset=utf-8\r
+Content-Transfer-Encoding: 7bit\r
+\r
+Hello\r
+world\r
+--" + boundary + "\r
+Content-Type: text/html; charset=utf-8\r
+Content-Transfer-Encoding: 7bit\r
+\r
+<p>Hello <b>world</b></p>\r
+--" + boundary + "--\r
+"
+    assert(rendered.ends_with(expected))
+
+    // HTML alone is a single part
+    message.text = ""
+    let html_only = render(message)
+    assert(headers_of(html_only).contains("\r\nContent-Type: text/html; charset=utf-8\r\n"))
+    assert(!html_only.contains("multipart"))
+}
+
+test "Rendering: attachments" {
+    let message = basic()
+    message.html = "<p>See the files</p>"
+    // Every byte value, several lines of base64
+    let bytes = ByteBuffer.new()
+    let i: uint = 0
+    while i < 512 {
+        bytes.write_byte((i % 256).to(u8))
+        i++
+    }
+    let data = bytes.to_string()
+    message.attach("data.bin", "application/octet-stream", data)
+    message.attach("Café \"menu\".pdf", "application/pdf", "\%PDF-1.4")
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+
+    assert(headers_of(rendered).contains("\r\nContent-Type: multipart/mixed; boundary=\"=_"))
+    let at = rendered.index_of("boundary=\"") !? 0
+    let outer = rendered.range(at + 10, 34)
+    let parts = rendered.split("--" + outer)
+    // Before the first boundary, the body, two files, and after the closing one
+    assert(parts.length == 5)
+    assert((parts.get(1) !? "").contains("Content-Type: multipart/alternative"))
+    assert((parts.get(4) !? "") == "--\r\n")
+
+    let file = parts.get(2) !? ""
+    assert(file.starts_with("\r\nContent-Type: application/octet-stream; name=\"data.bin\"\r\nContent-Disposition: attachment; filename=\"data.bin\"\r\nContent-Transfer-Encoding: base64\r\n\r\n"))
+    let body_at = file.index_of("\r\n\r\n") !? 0
+    let body = file.range(body_at, file.length - body_at).trim("\r\n")
+    each body.split("\r\n") as line : assert(line.length <= 76)
+    let decoded = crypto.base64_decode(body.replace("\r\n", "")) ! { assert(false) return }
+    assert(decoded == data)
+
+    // A name outside ASCII goes as RFC 2231 and as encoded-words
+    let pdf = (parts.get(3) !? "").replace("\r\n ", " ")
+    assert(pdf.contains("Content-Type: application/pdf; name=\"=?utf-8?B?"))
+    assert(pdf.contains("Content-Disposition: attachment; filename*=utf-8''Caf\%C3\%A9\%20\%22menu\%22.pdf\r\n"))
+
+    // A quote in a plain name is escaped
+    let quoted = basic()
+    quoted.attach("a \"b\".txt", "text/plain", "x")
+    assert(render(quoted).contains("filename=\"a \\\"b\\\".txt\""))
+
+    // A type may carry parameters
+    let csv = basic()
+    csv.attach("data.csv", "text/csv; charset=utf-8", "ä,b")
+    assert(render(csv).contains("\r\nContent-Type: text/csv; charset=utf-8; name=\"data.csv\"\r\n"))
+}
+
+test "Rendering: attach_file" {
+    let message = basic()
+    message.attach_file(test_cert()) ! { println(E.message) assert(false) return }
+    message.attach_file(test_cert(), "application/x-pem-file") ! { assert(false) return }
+    let first = message.attachments.get(0) ! { assert(false) return }
+    assert(first.filename == "cert.pem")
+    assert(first.content_type == fs.mime_type("pem"))
+    assert(first.data == (fs.read(test_cert()) !? ""))
+    assert((message.attachments.get(1) !? first).content_type == "application/x-pem-file")
+    message.attach_file(__DIR__ + "/assets/missing.txt") ! {
+        assert(error_is(E.code, invalid))
+        return
+    }
+    assert(false)
+}
+
+test "Rendering: quoted-printable and base64 bodies" {
+    let message = basic()
+    message.text = "Café crème \nnext"
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    assert(headers_of(rendered).contains("\r\nContent-Transfer-Encoding: quoted-printable\r\n"))
+    assert(rendered.ends_with("\r\n\r\nCaf=C3=A9 cr=C3=A8me=20\r\nnext\r\n"))
+
+    // A line too long to send as it is breaks softly, and nothing is lost
+    let long = "=".pad_right('a', 2000)
+    message.text = long
+    let soft = render(message)
+    assert(wire_safe(soft))
+    let body = soft.range((soft.index_of("\r\n\r\n") !? 0) + 4, soft.length)
+    assert(longest_line(body) <= 76)
+    assert(body.starts_with("=3Daaa"))
+    assert(body.replace("=\r\n", "").trim("\r\n") == "=3D" + long.range(1, long.length - 1))
+
+    // Mostly outside ASCII: base64
+    message.text = "日本語のテキストです。\n二行目。"
+    let cjk = render(message)
+    assert(wire_safe(cjk))
+    assert(headers_of(cjk).contains("\r\nContent-Transfer-Encoding: base64\r\n"))
+    let encoded = cjk.range((cjk.index_of("\r\n\r\n") !? 0) + 4, cjk.length).replace("\r\n", "")
+    assert((crypto.base64_decode(encoded) !? "") == "日本語のテキストです。\r\n二行目。")
+}
+
+test "Rendering: a message without a body" {
+    let message = smtp.Message { from: "a@example.com", to: .{ "b@example.com" } }
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    assert(rendered.ends_with("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\n\r\n"))
+    assert(!rendered.contains("Subject"))
+
+    // Attachments alone
+    message.attach("a.txt", "text/plain", "a")
+    let files = render(message)
+    assert(files.contains("multipart/mixed"))
+    assert(!files.contains("charset"))
+}
+
+test "Rendering: header injection is refused" {
+    let cases = Array[fn(smtp.Message)()]{
+        fn(m: smtp.Message) { m.subject = "Hi\r\nBcc: victim@example.com" },
+        fn(m: smtp.Message) { m.subject = "Hi\nX-Evil: 1" },
+        fn(m: smtp.Message) { m.subject = "Hi\rX-Evil: 1" },
+        fn(m: smtp.Message) { m.from = "Ada <ada@example.com>\r\nBcc: victim@example.com" },
+        fn(m: smtp.Message) { m.to = .{ "Bob\r\nBcc: victim@example.com <bob@example.com>" } },
+        fn(m: smtp.Message) { m.cc = .{ "bob@example.com\nBcc: victim@example.com" } },
+        fn(m: smtp.Message) { m.reply_to = "x@example.com\r\nX-Evil: 1" },
+        fn(m: smtp.Message) { m.headers.set("X-Tag", "a\r\nBcc: victim@example.com") },
+        fn(m: smtp.Message) { m.headers.set("X-Tag\r\nBcc", "victim@example.com") },
+        fn(m: smtp.Message) { m.headers.set("X Tag", "a") },
+        fn(m: smtp.Message) { m.headers.set("X-Tag:", "a") },
+        fn(m: smtp.Message) { m.headers.set("Bcc", "victim@example.com") },
+        fn(m: smtp.Message) { m.headers.set("content-type", "text/html") },
+        fn(m: smtp.Message) { m.attach("a.txt\r\nX-Evil: 1", "text/plain", "x") },
+        fn(m: smtp.Message) { m.attach("a.txt", "text/plain\r\nX-Evil: 1", "x") },
+        fn(m: smtp.Message) { m.attach("a.txt", "text plain", "x") },
+        fn(m: smtp.Message) { m.attach("a.txt", "tëxt/plain", "x") },
+        fn(m: smtp.Message) { m.headers.set("X-".pad_right('a', 77), "a") },
+        fn(m: smtp.Message) { m.attach("", "text/plain", "x") },
+        fn(m: smtp.Message) { m.from = "" },
+        fn(m: smtp.Message) { m.to = .{} m.cc = .{} m.bcc = .{} },
+    }
+    let refused: uint = 0
+    each cases as change {
+        let message = basic()
+        change(message)
+        message.render() ! {
+            if error_is(E.code, invalid) : refused++
+            continue
+        }
+        println("rendered anyway: " + message.subject)
+    }
+    assert(refused == cases.length)
+}
+
+test "Rendering: every line stays short" {
+    let message = basic()
+    message.subject = "S".pad_right('s', 1200)
+    message.text = "T".pad_right('t', 5000) + "\n" + "ü".pad_right('u', 3000)
+    message.html = "<p>" + "h".pad_right('h', 4000) + "</p>"
+    message.attach("big.bin", "application/octet-stream", "b".pad_right('b', 10000))
+    message.headers.set("X-Long", "v".pad_right('v', 2000))
+    let rendered = render(message)
+    assert(wire_safe(rendered))
+    assert(longest_line(rendered) <= 998)
+}

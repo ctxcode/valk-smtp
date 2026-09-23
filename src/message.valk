@@ -1,0 +1,276 @@
+use valk.fs
+use valk.time
+
+/// A file sent along with a message.
++ class Attachment {
+    /// The name the file is shown and saved under.
+    + filename: String
+    /// The MIME type, such as `application/pdf` or `text/csv; charset=utf-8`.
+    + content_type: String ("application/octet-stream")
+    /// The bytes of the file.
+    + data: String
+}
+
+/// An email: who it is from and for, what it says, and what comes with it.
+///
+/// Addresses are written the way they appear in a mail client: `ada@example.com` or
+/// `Ada Lovelace <ada@example.com>`. Recipients in `bcc` receive the message without appearing
+/// in it.
+///
+/// ```valk
+/// let message = smtp.Message {
+///     from: "Ada <ada@example.com>"
+///     to: .{ "bob@example.com" }
+///     subject: "The report"
+///     text: "It is attached."
+/// }
+/// message.attach("report.csv", "text/csv", "a,b\n1,2\n")
+/// ```
++ class Message {
+    /// The sender. It is also the address bounces go back to.
+    + from: String ("")
+    /// The main recipients.
+    + to: Array[String] (.{})
+    /// Recipients who receive a copy, visible to everyone.
+    + cc: Array[String] (.{})
+    /// Recipients who receive a copy without appearing anywhere in the message.
+    + bcc: Array[String] (.{})
+    /// The address replies go to, when it is not `from`.
+    + reply_to: String ("")
+    /// The subject line.
+    + subject: String ("")
+    /// The plain text body.
+    + text: String ("")
+    /// The HTML body. With `text` as well, the message carries both and the mail client
+    /// shows the one it prefers.
+    + html: String ("")
+    /// More headers, such as `List-Unsubscribe` or `X-Priority`, by name. The headers this
+    /// class writes itself cannot be set here.
+    + headers: Map[String] (.{})
+    /// The files that go with the message.
+    + attachments: Array[Attachment] (.{})
+    /// The date the message shows; null uses the moment it is rendered.
+    + date: ?time.DateTime (null)
+    /// The `Message-ID` header, such as `<id@example.com>`. Empty makes one up when the message is
+    /// rendered, and keeps it here, so that sending the message again sends the same id.
+    + message_id: String ("")
+
+    /// Adds a file with its name, MIME type and bytes.
+    + fn attach(filename: String, content_type: String, data: String) {
+        this.attachments.append(Attachment { filename: filename, content_type: content_type, data: data })
+    }
+
+    /// Adds the file at `path`, under its own name.
+    ///
+    /// An empty `content_type` is taken from the file extension, and is
+    /// `application/octet-stream` for an extension `fs.mime_type` does not know. Throws
+    /// `invalid` when the file cannot be read.
+    + fn attach_file(path: String, content_type: String ("")) !Error {
+        let data = fs.read(path) ! throw .invalid { message: "Cannot read the file '" + path + "'" }
+        let name = fs.basename(path)
+        this.attach(name, content_type.length > 0 ? content_type : fs.mime_type(fs.extension(name)), data)
+    }
+
+    /// Returns the addresses the message is delivered to: `to`, `cc` and `bcc`, without the
+    /// names and without doubles.
+    ///
+    /// Throws `invalid` when one of them is not a valid address.
+    + fn recipients() Array[String] !Error {
+        let result = Array[String]{}
+        let seen = HashSet[String]{}
+        each this.to as text : add_recipient(result, seen, text, "to") !>
+        each this.cc as text : add_recipient(result, seen, text, "cc") !>
+        each this.bcc as text : add_recipient(result, seen, text, "bcc") !>
+        return result
+    }
+
+    /// Returns the message as it goes over the wire: headers and body with CRLF line breaks,
+    /// no line longer than 998 characters, and everything outside ASCII encoded.
+    ///
+    /// Throws `invalid` when the message has no sender or no recipient, an address is not
+    /// valid, or a header holds a line break, which could otherwise smuggle in headers of its
+    /// own.
+    + fn render() String !Error {
+        if trim_space(this.from).length == 0 : throw .invalid { message: "The message has no sender in `from`" }
+        let from = field_address(this.from, "from") !>
+        let to = field_addresses(this.to, "to") !>
+        let cc = field_addresses(this.cc, "cc") !>
+        let bcc = field_addresses(this.bcc, "bcc") !>
+        if to.length + cc.length + bcc.length == 0 : throw .invalid { message: "The message has no recipients in `to`, `cc` or `bcc`" }
+        if has_line_break(this.subject) : throw .invalid { message: "The subject cannot contain a line break" }
+
+        let out = ByteBuffer.new(1024 + this.text.length + this.html.length)
+        let date = this.date ?? time.DateTime.now()
+        out.write("Date: ")
+        out.write(format_date(date))
+        out.write("\r\n")
+        write_folded(out, "From", address_tokens(from))
+        if to.length > 0 : write_folded(out, "To", address_list_tokens(to))
+        if cc.length > 0 : write_folded(out, "Cc", address_list_tokens(cc))
+        if trim_space(this.reply_to).length > 0 {
+            let reply_to = field_address(this.reply_to, "reply_to") !>
+            write_folded(out, "Reply-To", address_tokens(reply_to))
+        }
+        if this.subject.length > 0 : write_folded(out, "Subject", text_tokens(this.subject))
+
+        if this.message_id.length == 0 : this.message_id = "<" + random_hex(16) + "@" + from.domain() + ">"
+        check_message_id(this.message_id) !>
+        out.write("Message-ID: ")
+        out.write(this.message_id)
+        out.write("\r\n")
+
+        each this.headers as value, name {
+            check_header(name, value) !>
+            write_folded(out, name, text_tokens(value))
+        }
+        out.write("MIME-Version: 1.0\r\n")
+        this.write_body(out) !>
+        return out.to_string()
+    }
+
+    // Everything from the Content-Type of the message on
+    fn write_body(out: ByteBuffer) !Error {
+        if this.attachments.length == 0 {
+            this.write_content(out, false)
+            return
+        }
+        each this.attachments as attachment : check_attachment(attachment) !>
+
+        let boundary = new_boundary()
+        out.write("Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n")
+        if this.text.length > 0 || this.html.length > 0 {
+            out.write("--" + boundary + "\r\n")
+            this.write_content(out, true)
+        }
+        each this.attachments as attachment {
+            out.write("--" + boundary + "\r\n")
+            write_attachment(out, attachment)
+        }
+        out.write("--" + boundary + "--\r\n")
+    }
+
+    // The text and HTML bodies: one part, or both as alternatives of each other
+    fn write_content(out: ByteBuffer, in_multipart: bool) {
+        if this.text.length > 0 && this.html.length > 0 {
+            let boundary = new_boundary()
+            out.write("Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n")
+            out.write("--" + boundary + "\r\n")
+            write_text_part(out, "text/plain", this.text, true)
+            out.write("--" + boundary + "\r\n")
+            write_text_part(out, "text/html", this.html, true)
+            out.write("--" + boundary + "--\r\n")
+            return
+        }
+        if this.html.length > 0 {
+            write_text_part(out, "text/html", this.html, in_multipart)
+            return
+        }
+        write_text_part(out, "text/plain", this.text, in_multipart)
+    }
+}
+
+// Headers and body of one text part. Inside a multipart the CRLF before the next boundary
+// belongs to that boundary, so one is always added there.
+fn write_text_part(out: ByteBuffer, type: String, content: String, in_multipart: bool) {
+    let text = normalize_newlines(content)
+    out.write("Content-Type: " + type + "; charset=utf-8\r\n")
+    if is_7bit(text) {
+        out.write("Content-Transfer-Encoding: 7bit\r\n\r\n")
+        out.write(text)
+        if in_multipart || !text.ends_with("\r\n") : out.write("\r\n")
+        return
+    }
+    if mostly_8bit(text) {
+        out.write("Content-Transfer-Encoding: base64\r\n\r\n")
+        write_base64_lines(out, text)
+        return
+    }
+    out.write("Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+    out.write(quoted_printable(text))
+    out.write("\r\n")
+}
+
+fn write_attachment(out: ByteBuffer, attachment: Attachment) {
+    let name = attachment.filename
+    let type = attachment.content_type.length > 0 ? attachment.content_type : "application/octet-stream"
+    // Plain names are quoted; others go as RFC 2231 in the disposition, which is the standard,
+    // and as encoded-words in the type, which older clients read instead
+    if needs_encoding(name) {
+        write_folded(out, "Content-Type", .{ type + ";", "name=\"" + encoded_words(name).join(" ") + "\"" })
+        write_folded(out, "Content-Disposition", .{ "attachment;", "filename*=" + rfc2231_value(name) })
+    } else {
+        write_folded(out, "Content-Type", .{ type + ";", "name=" + quote(name) })
+        write_folded(out, "Content-Disposition", .{ "attachment;", "filename=" + quote(name) })
+    }
+    out.write("Content-Transfer-Encoding: base64\r\n\r\n")
+    write_base64_lines(out, attachment.data)
+}
+
+fn check_attachment(attachment: Attachment) !Error {
+    let name = attachment.filename
+    if name.length == 0 : throw .invalid { message: "An attachment has no filename" }
+    if name.length > 255 : throw .invalid { message: "The attachment name '" + name.range(0, 40) + "...' is longer than 255 bytes" }
+    if has_line_break(name) : throw .invalid { message: "An attachment name cannot contain a line break" }
+    // Parameters such as `; charset=utf-8` may follow the type
+    let type = attachment.content_type
+    let ok = type.length == 0 || (type.length <= 200 && type.contains_byte('/'))
+    each type as ch {
+        if ch < 0x20 || ch > 0x7e : ok = false
+    }
+    if !ok : throw .invalid { message: "'" + type + "' is not a MIME type" }
+}
+
+// Headers this package writes itself, which `headers` cannot replace
+global reserved_headers: HashSet[String] (.{
+    "from", "to", "cc", "bcc", "reply-to", "subject", "date", "message-id", "mime-version",
+    "content-type", "content-transfer-encoding", "content-disposition"
+})
+
+fn check_header(name: String, value: String) !Error {
+    if name.length == 0 || name.length > 76 : throw .invalid { message: "A header name needs 1 to 76 characters" }
+    each name as ch {
+        if ch < 33 || ch > 126 || ch == ':' : throw .invalid { message: "'" + name + "' is not a header name" }
+    }
+    if reserved_headers.has(name.lower()) {
+        throw .invalid { message: "The '" + name + "' header is written by the message itself; use its property instead" }
+    }
+    if has_line_break(value) : throw .invalid { message: "The '" + name + "' header cannot contain a line break" }
+}
+
+fn check_message_id(id: String) !Error {
+    let ok = id.length > 2 && id.length < 900 && id[0] == '<' && id[id.length - 1] == '>' && id.contains_byte('@')
+    each id as ch {
+        if ch <= 0x20 || ch > 0x7e : ok = false
+    }
+    if !ok : throw .invalid { message: "'" + id + "' is not a message id; it looks like <id@example.com>" }
+}
+
+fn field_address(text: String, field: String) Address !Error {
+    return parse_address(text) ! throw .invalid { message: "In `" + field + "`: " + E.message }
+}
+
+fn field_addresses(texts: Array[String], field: String) Array[Address] !Error {
+    let result = Array[Address]{}
+    each texts as text : result.append(field_address(text, field) !>)
+    return result
+}
+
+fn add_recipient(result: Array[String], seen: HashSet[String], text: String, field: String) !Error {
+    let address = field_address(text, field) !>
+    if seen.insert(address.email.lower()) : result.append(address.email)
+}
+
+// `=_` never shows up in base64 or quoted-printable, and 128 random bits keep the boundary out
+// of plain text
+fn new_boundary() String {
+    return "=_" + random_hex(16)
+}
+
+/// The date as RFC 5322 writes it, such as `Tue, 22 Sep 2026 14:07:09 +0000`.
++ fn format_date(date: time.DateTime) String {
+    let days = Array[String]{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" }
+    let months = Array[String]{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+    let day = days.get(date.day_of_week() - 1) !? "Mon"
+    let month = months.get(date.month() - 1) !? "Jan"
+    return day + ", " + date.format("d ") + month + date.format(" Y H:i:s") + " +0000"
+}

@@ -1,0 +1,433 @@
+use valk.net
+use valk.crypto
+
+// Bytes asked from the socket per read
+value RECV_CHUNK (16384)
+// Longest reply line accepted; RFC 5321 allows 512 bytes, this leaves plenty of room
+value MAX_REPLY_LINE (65536)
+// Most lines one reply may have
+value MAX_REPLY_LINES (1000)
+
+/// Opens a connection described by a `Config`: greets the server, switches to TLS as
+/// `security` says, and logs in when `username` is set.
+///
+/// ```valk
+/// let client = smtp.connect_with(smtp.Config {
+///     host: "smtp.example.com"
+///     username: "ada@example.com"
+///     password: "secret"
+/// }) ! panic("%{E.message}")
+/// ```
++ fn connect_with(config: Config) Client !Error {
+    if has_line_break(config.helo_name) || config.helo_name.contains_byte(' ') {
+        throw .invalid { message: "'" + config.helo_name + "' is not a name to introduce the client with" }
+    }
+    let port = config.port_or_default()
+    let sock = net.tcp_client(config.host, port, config.timeout_ms) ! {
+        if error_is(E.code, timeout) : throw .timeout { message: "Connecting to %{config.host}:%{port} took too long" }
+        throw .connect { message: "Failed to connect to %{config.host}:%{port}" }
+    }
+    sock.set_timeouts(config.timeout_ms, config.timeout_ms)
+
+    let client = Client { con: sock, config: config }
+    client.open() ! {
+        client.drop()
+        throw E
+    }
+    return client
+}
+
+/// Opens a connection to `host` and logs in when `username` is given.
+///
+/// A `port` of 0 picks the usual one for `security`. See `Config` for everything else, and
+/// `connect_with` to set it.
+///
+/// ```valk
+/// let client = smtp.connect("smtp.example.com", 587, smtp.Security.starttls, "ada@example.com", "secret") ! panic("%{E.message}")
+/// defer client.close()
+/// ```
++ fn connect(host: String, port: u16 (0), security: Security (Security.starttls), username: String (""), password: String (""), timeout_ms: uint (30000)) Client !Error {
+    return connect_with(Config {
+        host: host
+        port: port
+        security: security
+        username: username
+        password: password
+        timeout_ms: timeout_ms
+    }) !>
+}
+
+/// Opens a connection described by an `smtp://` or `smtps://` URL; see `config_from_url`.
++ fn connect_url(text: String, timeout_ms: uint (30000)) Client !Error {
+    return connect_with(config_from_url(text, timeout_ms) !>) !>
+}
+
+/// Connects, sends one message and closes the connection again. Returns what the server
+/// answered to the message, which often names the id it was queued under.
+///
+/// ```valk
+/// smtp.send(config, message) ! panic("%{E.message}")
+/// ```
++ fn send(config: Config, message: Message) String !Error {
+    let client = connect_with(config) !>
+    defer client.close()
+    return client.send(message) !>
+}
+
+// One reply: a three digit code and its lines, without the code
+class Reply {
+    code: uint
+    lines: Array[String]
+
+    fn text() String {
+        return this.lines.join("\n")
+    }
+}
+
+/// A connection to a mail server, ready to send messages.
+///
+/// Messages go one after another over the same connection. A client belongs to one coroutine
+/// or one thread at a time.
++ class Client {
+    con: net.TcpConnection
+    /// The settings this client was opened with.
+    ~ config: Config
+    /// The first line of the server's greeting, without its code.
+    ~ greeting: String ("")
+    /// The extensions the server announced in its `EHLO` reply, by keyword in upper case, each
+    /// with the rest of its line: `SIZE` with `"35882577"`, `AUTH` with `"PLAIN LOGIN"`. Empty
+    /// for a server that only speaks `HELO`.
+    ~ extensions: Map[String] (.{})
+    /// Whether the connection runs over TLS.
+    ~ tls_active: bool (false)
+    /// Whether the client logged in.
+    ~ authenticated: bool (false)
+    /// Whether `close` was called, or the connection broke.
+    ~ closed: bool (false)
+    /// Prints every line sent and received when true; credentials are left out.
+    + debug: bool (false)
+    data_in: ByteBuffer (.new())
+    read_offset: uint (0) // Start of the unread bytes in data_in
+    started: bool (false) // Whether a mail transaction was started, so the next one resets first
+
+    // Greeting, EHLO, STARTTLS and login
+    fn open() !Error {
+        let config = this.config
+        if config.security == Security.tls : this.start_tls() !>
+
+        let greeting = this.read_reply() !>
+        if greeting.code != 220 {
+            throw .connect { message: "The server refused the connection: " + greeting.text(), reply_code: greeting.code, reply: greeting.text() }
+        }
+        this.greeting = greeting.lines.get(0) !? ""
+        this.hello() !>
+
+        if config.security == Security.starttls || config.security == Security.starttls_optional {
+            if this.extensions.has("STARTTLS") {
+                let reply = this.command("STARTTLS") !>
+                if reply.code != 220 {
+                    throw .tls { message: "The server refused STARTTLS: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+                }
+                // Anything sent before the handshake was not protected by it, and would be
+                // taken for a reply that came over TLS
+                if this.data_in.length > this.read_offset {
+                    throw .tls { message: "The server sent data before the TLS handshake" }
+                }
+                this.start_tls() !>
+                // What the server offers can change once the connection is private
+                this.hello() !>
+            } else if config.security == Security.starttls {
+                throw .tls { message: "The server does not offer STARTTLS. Use `Security.tls` if it expects TLS from the start, or `Security.plain` to send without TLS." }
+            }
+        }
+
+        if config.username.length > 0 : this.login() !>
+    }
+
+    fn start_tls() !Error {
+        let config = this.config
+        let tls = config.tls
+        let ssl = net.Ssl.new()
+        ssl.set_verify(tls.verify)
+        let ca_file = tls.ca_file
+        if isset(ca_file) : ssl.set_ca_cert(ca_file) ! throw .tls { message: "Cannot read the CA file '" + ca_file + "'" }
+        let ca_dir = tls.ca_dir
+        if isset(ca_dir) : ssl.set_ca_cert_dir(ca_dir) ! throw .tls { message: "Cannot read the CA directory '" + ca_dir + "'" }
+        this.con.ssl_connect(ssl, config.timeout_ms) ! {
+            if error_is(E.code, timeout) : throw .timeout { message: "The TLS handshake took too long" }
+            throw .tls { message: "The TLS handshake failed: " + ssl.get_error_message() }
+        }
+        this.tls_active = true
+    }
+
+    // EHLO, or HELO for a server from before ESMTP
+    fn hello() !Error {
+        let name = this.helo_name()
+        let reply = this.command("EHLO " + name) !>
+        this.extensions = .{}
+        if reply.code == 250 {
+            each reply.lines as line, index {
+                if index == 0 : continue // the server's own name
+                let split = line.index_of_byte(' ') !? line.length
+                let keyword = line.range(0, split).upper()
+                let params = split < line.length ? line.range(split + 1, line.length - split - 1) : ""
+                // Old servers also write `AUTH=PLAIN LOGIN`
+                let equals = keyword.index_of_byte('=') !? 0
+                if equals > 0 {
+                    params = line.range(equals + 1, line.length - equals - 1)
+                    keyword = keyword.range(0, equals)
+                    if this.extensions.has(keyword) : continue
+                }
+                this.extensions.set(keyword, params)
+            }
+            return
+        }
+        let helo = this.command("HELO " + name) !>
+        if helo.code != 250 {
+            throw .protocol { message: "The server refused EHLO and HELO: " + helo.text(), reply_code: helo.code, reply: helo.text() }
+        }
+    }
+
+    fn helo_name() String {
+        if this.config.helo_name.length > 0 : return this.config.helo_name
+        let address = this.con.local_address() ! return "localhost"
+        if address.ipv6 : return "[IPv6:" + address.ip() + "]"
+        return "[" + address.ip() + "]"
+    }
+
+    fn login() !Error {
+        let config = this.config
+        if !this.tls_active && !config.allow_insecure_auth {
+            throw .auth { message: "Refusing to send the password over a connection without TLS. Use STARTTLS or TLS, or set `allow_insecure_auth` for a network you trust." }
+        }
+        let method = config.auth
+        if method == AuthMethod.auto {
+            let offered = this.extensions.get("AUTH") ! throw .auth { message: "The server does not offer to log in" }
+            let mechanisms = offered.upper().split(" ")
+            if mechanisms.contains("PLAIN") : method = AuthMethod.plain
+            else if mechanisms.contains("LOGIN") : method = AuthMethod.login
+            else : throw .auth { message: "The server offers to log in with " + offered + ", and this client speaks PLAIN and LOGIN" }
+        }
+
+        let reply = Reply { code: 0, lines: .{} }
+        if method == AuthMethod.plain {
+            let token = crypto.base64_encode("\x00" + config.username + "\x00" + config.password)
+            reply = this.command("AUTH PLAIN " + token, "AUTH PLAIN <credentials>") !>
+        } else {
+            reply = this.command("AUTH LOGIN") !>
+            if reply.code == 334 : reply = this.command(crypto.base64_encode(config.username), "<username>") !>
+            if reply.code == 334 : reply = this.command(crypto.base64_encode(config.password), "<password>") !>
+        }
+        if reply.code != 235 {
+            throw .auth { message: "The server did not accept the login: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+        }
+        this.authenticated = true
+    }
+
+    /// Sends a message and returns what the server answered to it, which often names the id it
+    /// was queued under.
+    ///
+    /// The message goes to everyone in `to`, `cc` and `bcc`. When the server refuses one of
+    /// them, nothing is sent and `recipient` is thrown, naming that address.
+    + fn send(message: Message) String !Error {
+        let data = message.render() !>
+        let from = parse_address(message.from) !>
+        return this.send_raw(from.email, message.recipients() !>, data) !>
+    }
+
+    /// Sends a message that is already rendered, with an envelope of its own: `from` is where
+    /// bounces go, and `recipients` is who receives it, whatever the headers in `data` say.
+    ///
+    /// Line breaks in `data` are sent as CRLF, and lines that start with a dot are escaped.
+    + fn send_raw(from: String, recipients: Array[String], data: String) String !Error {
+        if this.closed : throw .closed { message: "The connection is closed" }
+        let sender = parse_address(from) !>
+        if recipients.length == 0 : throw .invalid { message: "The message has no recipients" }
+        let addresses = Array[String]{}
+        each recipients as recipient : addresses.append((parse_address(recipient) !>).email)
+
+        // The server keeps no state from an earlier message; RSET makes sure of that
+        if this.started {
+            let reset = this.command("RSET") !>
+            if reset.code != 250 : throw .protocol { message: "The server refused RSET: " + reset.text(), reply_code: reset.code, reply: reset.text() }
+        }
+        let body = stuff_data(data)
+        let mail = "MAIL FROM:<" + sender.email + ">"
+        if this.extensions.has("SIZE") {
+            let limit = (this.extensions.get("SIZE") !? "").to_uint() !? 0
+            if limit > 0 && body.length > limit {
+                throw .rejected { message: "The message is %{body.length} bytes and the server accepts at most %{limit}" }
+            }
+            mail += " SIZE=" + body.length
+        }
+        this.started = true
+        let reply = this.command(mail) !>
+        if reply.code != 250 {
+            throw .sender { message: "The server refused the sender <" + sender.email + ">: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+        }
+        each addresses as address {
+            reply = this.command("RCPT TO:<" + address + ">") !>
+            if reply.code != 250 && reply.code != 251 {
+                throw .recipient { message: "The server refused the recipient <" + address + ">: " + reply.text(), reply_code: reply.code, reply: reply.text(), address: address }
+            }
+        }
+        reply = this.command("DATA") !>
+        if reply.code != 354 {
+            throw .rejected { message: "The server refused to take the message: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+        }
+        if this.debug : println("C: <%{body.length} bytes of message>")
+        this.write(body) !>
+        reply = this.read_reply() !>
+        if reply.code != 250 {
+            throw .rejected { message: "The server refused the message: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+        }
+        return reply.text()
+    }
+
+    /// Sends `NOOP` and returns whether the server answered, to check that the connection is
+    /// still up.
+    + fn ping() bool {
+        if this.closed : return false
+        let reply = this.command("NOOP") ! return false
+        return reply.code == 250
+    }
+
+    /// Returns whether the server announced an extension, such as `SMTPUTF8` or `PIPELINING`.
+    + fn has_extension(name: String) bool {
+        return this.extensions.has(name.upper())
+    }
+
+    /// Says goodbye with `QUIT` and closes the connection. Does nothing when it is closed
+    /// already.
+    + fn close() {
+        if this.closed : return
+        // The server gets a moment to answer, not the whole timeout
+        let wait = this.config.timeout_ms
+        if wait == 0 || wait > 5000 : wait = 5000
+        this.con.set_timeouts(wait, wait)
+        this.command("QUIT") _
+        this.drop()
+    }
+
+    // Closes the socket without a word
+    fn drop() {
+        if this.closed : return
+        this.closed = true
+        this.con.close() _
+    }
+
+    //
+    // Sending and receiving
+    //
+
+    // Sends one command line and reads the reply. `shown` replaces the line in debug output.
+    fn command(line: String, shown: String ("")) Reply !Error {
+        if this.closed : throw .closed { message: "The connection is closed" }
+        if this.debug : println("C: " + (shown.length > 0 ? shown : line))
+        this.write(line + "\r\n") !>
+        let reply = this.read_reply() !>
+        if reply.code == 421 {
+            throw .closed { message: "The server is closing the connection: " + reply.text(), reply_code: reply.code, reply: reply.text() }
+        }
+        return reply
+    }
+
+    fn write(data: local &[u8]) !Error {
+        this.con.write(data) ! {
+            this.drop()
+            if error_is(E.code, timeout) : throw .timeout { message: "Sending to the server took too long" }
+            if error_is(E.code, closed) : throw .closed { message: "The server closed the connection" }
+            throw .connect { message: "Failed to send to the server" }
+        }
+    }
+
+    // Reads one reply, which may run over several lines: `250-first`, `250-second`, `250 last`
+    fn read_reply() Reply !Error {
+        let lines = Array[String]{}
+        let code: uint = 0
+        while true {
+            let line = this.read_line() !>
+            if this.debug : println("S: " + line)
+            let valid = line.length >= 3 && is_digit(line[0]) && is_digit(line[1]) && is_digit(line[2])
+            if !valid || (line.length > 3 && line[3] != ' ' && line[3] != '-') {
+                throw .protocol { message: "The server sent '" + line + "' where a reply belongs" }
+            }
+            let line_code = ((line[0] - '0').to(uint) * 100) + ((line[1] - '0').to(uint) * 10) + (line[2] - '0').to(uint)
+            if lines.length > 0 && line_code != code {
+                throw .protocol { message: "The server changed the reply code in the middle of a reply" }
+            }
+            code = line_code
+            lines.append(line.length > 4 ? line.range(4, line.length - 4) : "")
+            if line.length <= 3 || line[3] == ' ' : break
+            if lines.length >= MAX_REPLY_LINES : throw .protocol { message: "The server sent a reply of more than %{MAX_REPLY_LINES} lines" }
+        }
+        // 421: the server is shutting down and closes the connection
+        if code == 421 : this.drop()
+        return Reply { code: code, lines: lines }
+    }
+
+    // Reads up to the next LF and returns the line without its line break
+    fn read_line() String !Error {
+        let searched: uint = 0
+        while true {
+            let buf = this.data_in
+            let start = this.read_offset
+            let found = buf.index_of('\n', start + searched) ! {
+                searched = buf.length - start
+                if searched > MAX_REPLY_LINE : throw .protocol { message: "The server sent a line longer than %{MAX_REPLY_LINE} bytes" }
+                this.fill() !>
+                continue
+            }
+            let length = found - start
+            if length > 0 && buf.get(found - 1) == '\r' : length--
+            this.read_offset = found + 1
+            return buf.range(start, length)
+        }
+    }
+
+    // Reads more bytes from the socket, dropping what was consumed first
+    fn fill() !Error {
+        if this.closed : throw .closed { message: "The connection is closed" }
+        let buf = this.data_in
+        if this.read_offset > 0 {
+            buf.clear_until(this.read_offset)
+            this.read_offset = 0
+        }
+        buf.reserve(RECV_CHUNK)
+        let spare = buf.view_spare(RECV_CHUNK)
+        let count = this.con.read(spare) ! {
+            this.drop()
+            if error_is(E.code, timeout) : throw .timeout { message: "The server did not answer in time" }
+            if error_is(E.code, closed) : throw .closed { message: "The server closed the connection" }
+            throw .connect { message: "Failed to read from the server" }
+        }
+        buf.skip(count)
+    }
+}
+
+fn is_digit(ch: u8) bool {
+    return ch >= '0' && ch <= '9'
+}
+
+// The message as DATA sends it: CRLF line breaks, a dot doubled at the start of a line so the
+// server does not take it for the end, and the `.` line that is the end
+fn stuff_data(data: String) ByteBuffer {
+    let out = ByteBuffer.new(data.length + data.length / 32 + 8)
+    let line_start = true
+    let i: uint = 0
+    while i < data.length {
+        let ch = data[i++]
+        if ch == '\r' || ch == '\n' {
+            if ch == '\r' && i < data.length && data[i] == '\n' : i++
+            out.write("\r\n")
+            line_start = true
+            continue
+        }
+        if line_start && ch == '.' : out.write_byte('.')
+        out.write_byte(ch)
+        line_start = false
+    }
+    if !line_start : out.write("\r\n")
+    out.write(".\r\n")
+    return out
+}

@@ -1,0 +1,185 @@
+use smtp
+use valk.net
+
+// A scripted SMTP server that runs in the test process. It serves one connection, answers the
+// way its settings say, and records both sides of the conversation, so a test can assert the
+// exact exchange without any service running.
+
+// The certificate and key the fake server uses for TLS, made for localhost and 127.0.0.1 and
+// trusted by nothing but these tests
+fn test_cert() String {
+    return __DIR__ + "/assets/cert.pem"
+}
+fn test_key() String {
+    return __DIR__ + "/assets/key.pem"
+}
+
+class FakeServer {
+    listener: shared net.TcpServer
+    port: u16
+    // How it behaves
+    greeting: String ("220 fake.test ESMTP ready")
+    extensions: Array[String] (.{ "SIZE 1000000", "AUTH PLAIN LOGIN", "8BITMIME" })
+    starttls: bool (false) // offer STARTTLS
+    implicit_tls: bool (false) // TLS from the first byte
+    ehlo: bool (true) // false answers EHLO with 502, like a server that only knows HELO
+    auth_ok: bool (true) // false answers the credentials with 535
+    reject: Array[String] (.{}) // recipients answered with 550
+    mail_reply: String ("250 2.1.0 Ok")
+    data_reply: String ("250 2.0.0 Ok: queued as FAKE1")
+    after_starttls: String ("") // sent right behind the STARTTLS reply, before the handshake
+    // What it saw
+    lines: Array[String] (.{})
+    messages: Array[String] (.{}) // the DATA of each message, dots unstuffed
+    raw_messages: Array[String] (.{}) // the DATA as it came, terminator included
+    bare_newline: bool (false) // a line ended in a lone LF
+
+    // Both sides of the conversation, one line each, `C:` for the client and `S:` for the server
+    fn transcript() String {
+        return this.lines.join("\n")
+    }
+
+    fn say(con: net.TcpConnection, line: String) bool {
+        this.lines.append("S: " + line)
+        con.write(line + "\r\n") ! return false
+        return true
+    }
+}
+
+fn fake_server() FakeServer {
+    let listener = net.tcp_server("127.0.0.1", 0) ! panic("The fake server cannot listen")
+    let address = listener.local_address() ! panic("The fake server has no address")
+    return FakeServer { listener: listener, port: address.port }
+}
+
+// Settings that talk to a fake server without TLS
+fn fake_config(fake: FakeServer) smtp.Config {
+    return smtp.Config {
+        host: "127.0.0.1"
+        port: fake.port
+        security: smtp.Security.plain
+        helo_name: "client.test"
+        timeout_ms: 5000
+    }
+}
+
+// Reads CRLF lines from a connection, keeping the line break so a lone LF shows
+class LineSource {
+    con: net.TcpConnection
+    buf: ByteBuffer (.new())
+
+    fn next() ?String {
+        while true {
+            let at = this.buf.index_of('\n') ! {
+                this.buf.reserve(4096)
+                let count = this.con.read(this.buf.view_spare(4096)) ! return null
+                this.buf.skip(count)
+                continue
+            }
+            let line = this.buf.range(0, at + 1)
+            this.buf.clear_until(at + 1)
+            return line
+        }
+    }
+}
+
+fn server_context() ?shared net.SslServerContext {
+    let context: shared net.SslServerContext = net.SslServerContext.new(test_cert(), test_key()) ! return null
+    return context
+}
+
+// Serves one connection and returns "ok", or what went wrong
+fn serve(fake: FakeServer) String {
+    let con = fake.listener.accept(5000) ! return "accept failed"
+    if fake.implicit_tls {
+        let context = server_context() ?! return "no TLS context"
+        con.ssl_accept(context, 5000) ! return "TLS handshake failed"
+    }
+    let source = LineSource { con: con }
+    // No greeting at all: wait for the client to give up
+    if fake.greeting.length == 0 {
+        source.next()
+        con.close() _
+        return "ok"
+    }
+    if !fake.say(con, fake.greeting) : return "write failed"
+
+    while true {
+        let raw = source.next() ?! break
+        if !raw.ends_with("\r\n") : fake.bare_newline = true
+        let line = raw.rtrim("\n").rtrim("\r")
+        fake.lines.append("C: " + line)
+        let command = line.upper()
+
+        if command.starts_with("EHLO ") {
+            if !fake.ehlo {
+                fake.say(con, "502 5.5.2 Error: command not recognized")
+                continue
+            }
+            let replies = Array[String]{ "fake.test" }
+            replies.append_many(fake.extensions)
+            if fake.starttls && !con.ssl_enabled : replies.append("STARTTLS")
+            each replies as reply, index {
+                fake.say(con, (index + 1 < replies.length ? "250-" : "250 ") + reply)
+            }
+        } else if command.starts_with("HELO ") {
+            fake.say(con, "250 fake.test")
+        } else if command == "STARTTLS" {
+            if fake.after_starttls.length > 0 {
+                // In the same packet as the reply, the way an attacker in the middle adds it
+                fake.lines.append("S: 220 2.0.0 Ready to start TLS")
+                con.write("220 2.0.0 Ready to start TLS\r\n" + fake.after_starttls) _
+                continue
+            }
+            fake.say(con, "220 2.0.0 Ready to start TLS")
+            let context = server_context() ?! return "no TLS context"
+            con.ssl_accept(context, 5000) ! return "TLS handshake failed"
+            source = LineSource { con: con }
+        } else if command.starts_with("AUTH PLAIN ") {
+            fake.say(con, fake.auth_ok ? "235 2.7.0 Authentication successful" : "535 5.7.8 Error: authentication failed")
+        } else if command == "AUTH LOGIN" {
+            fake.say(con, "334 VXNlcm5hbWU6")
+            let user = source.next() ?! break
+            fake.lines.append("C: " + user.rtrim("\n").rtrim("\r"))
+            fake.say(con, "334 UGFzc3dvcmQ6")
+            let pass = source.next() ?! break
+            fake.lines.append("C: " + pass.rtrim("\n").rtrim("\r"))
+            fake.say(con, fake.auth_ok ? "235 2.7.0 Authentication successful" : "535 5.7.8 Error: authentication failed")
+        } else if command.starts_with("MAIL FROM:") {
+            fake.say(con, fake.mail_reply)
+        } else if command.starts_with("RCPT TO:") {
+            let rejected = false
+            each fake.reject as address {
+                if line.contains("<" + address + ">") : rejected = true
+            }
+            if rejected : fake.say(con, "550 5.1.1 " + line.range(8, line.length - 8) + ": Recipient address rejected")
+            else : fake.say(con, "250 2.1.5 Ok")
+        } else if command == "DATA" {
+            fake.say(con, "354 End data with <CR><LF>.<CR><LF>")
+            let raw_data = ByteBuffer.new()
+            let data = ByteBuffer.new()
+            while true {
+                let data_line = source.next() ?! return "the client left during DATA"
+                raw_data.write(data_line)
+                if !data_line.ends_with("\r\n") : fake.bare_newline = true
+                if data_line == ".\r\n" : break
+                // A doubled dot at the start of a line stands for one
+                if data_line.starts_with(".") : data.write(data_line.range(1, data_line.length - 1))
+                else : data.write(data_line)
+            }
+            fake.messages.append(data.to_string())
+            fake.raw_messages.append(raw_data.to_string())
+            fake.lines.append("C: <message>")
+            fake.say(con, fake.data_reply)
+        } else if command == "RSET" || command == "NOOP" {
+            fake.say(con, "250 2.0.0 Ok")
+        } else if command == "QUIT" {
+            fake.say(con, "221 2.0.0 Bye")
+            break
+        } else {
+            fake.say(con, "502 5.5.2 Error: command not recognized")
+        }
+    }
+    con.close() _
+    return "ok"
+}

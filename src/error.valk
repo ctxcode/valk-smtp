@@ -1,0 +1,27 @@
+/// Thrown by every operation of this package.
+///
+/// - `connect`: the TCP connection could not be opened, or reading and writing failed.
+/// - `tls`: the TLS handshake failed, its settings could not be used, or STARTTLS was required
+///   and the server does not offer it.
+/// - `auth`: the server rejected the credentials, offers no mechanism this package speaks, or
+///   the credentials would have gone over a connection without TLS.
+/// - `sender`: the server refused the sender (`MAIL FROM`).
+/// - `recipient`: the server refused a recipient (`RCPT TO`); `address` holds which one.
+/// - `rejected`: the server refused the message itself, at `DATA` or after it, or the message
+///   is larger than the server accepts.
+/// - `protocol`: the server sent something this package did not expect.
+/// - `timeout`: the server did not answer in time.
+/// - `closed`: the connection is closed, or the server answered `421` to say it is closing it.
+/// - `invalid`: the message or the settings cannot be used as they are: a missing sender or
+///   recipient, an address that is not valid, a line break in a header, or a URL that is not
+///   an SMTP URL.
+///
+/// `reply_code` holds the three digit SMTP code of the reply that caused the error, and 0 when
+/// there was none. A code from 400 to 499 is temporary, so the same message may succeed later;
+/// one from 500 up is permanent. `reply` holds the text of that reply.
++ error Error (connect, tls, auth, sender, recipient, rejected, protocol, timeout, closed, invalid) payload {
+    message: String
+    reply_code: uint (0)
+    reply: String ("")
+    address: String ("")
+}

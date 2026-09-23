@@ -1,0 +1,174 @@
+/// An email address, with the name shown for it.
++ class Address {
+    /// The display name, such as `Ada Lovelace`; empty when there is none.
+    + name: String ("")
+    /// The address itself, such as `ada@example.com`.
+    + email: String
+
+    /// Returns the domain: everything after the `@`.
+    + fn domain() String {
+        let at = this.email.index_of_byte('@') !? 0
+        return this.email.range(at + 1, this.email.length - at - 1)
+    }
+}
+
+/// Reads an address as it is written in a message: `ada@example.com`, `<ada@example.com>`,
+/// `Ada Lovelace <ada@example.com>` or `"Lovelace, Ada" <ada@example.com>`.
+///
+/// Throws `invalid` when the text is not one address. The address must be ASCII: a local part
+/// of letters, digits, dots and ``!#$%&'*+-/=?^_`{|}~``, and a domain of letters, digits,
+/// hyphens and dots, or an address literal such as `[192.0.2.1]`. The name may be any text,
+/// except that it cannot hold a line break.
+///
+/// ```valk
+/// let address = smtp.parse_address("Ada <ada@example.com>") ! panic("%{E.message}")
+/// println(address.name)   // Ada
+/// println(address.email)  // ada@example.com
+/// ```
++ fn parse_address(text: String) Address !Error {
+    if has_line_break(text) : throw .invalid { message: "An address cannot contain a line break" }
+    let value = trim_space(text)
+    if value.length == 0 : throw .invalid { message: "The address is empty" }
+
+    if value[value.length - 1] != '>' {
+        check_email(value) !>
+        return Address { email: value }
+    }
+
+    // `Name <email>`: the `<` that opens the address is the last one outside quotes
+    let open: ?uint = null
+    let quoted = false
+    let i: uint = 0
+    while i < value.length {
+        let ch = value[i]
+        if ch == '\\' && quoted {
+            i += 2
+            continue
+        }
+        if ch == '"' : quoted = !quoted
+        else if ch == '<' && !quoted : open = i
+        i++
+    }
+    if !isset(open) : throw .invalid { message: "'" + text + "' has a '>' without a '<'" }
+    let email = value.range(open + 1, value.length - open - 2)
+    check_email(email) ! throw .invalid { message: "'" + text + "' is not a valid address: " + E.message }
+    let name = trim_space(value.range(0, open))
+    if name.length >= 2 && name[0] == '"' && name[name.length - 1] == '"' {
+        name = unquote(name.range(1, name.length - 2))
+    } else if name.contains_byte('<') || name.contains_byte('>') {
+        throw .invalid { message: "'" + text + "' has more than one address; a name with '<' or '>' needs quotes" }
+    }
+    return Address { name: name, email: email }
+}
+
+// Checks the address itself, `local@domain`
+fn check_email(email: String) !Error {
+    let at = email.index_of_byte('@') ! throw .invalid { message: "'" + email + "' has no '@'" }
+    let local = email.range(0, at)
+    let domain = email.range(at + 1, email.length - at - 1)
+    if local.length == 0 || local.length > 64 : throw .invalid { message: "'" + email + "' needs 1 to 64 characters before the '@'" }
+    if domain.length == 0 || domain.length > 255 : throw .invalid { message: "'" + email + "' needs 1 to 255 characters after the '@'" }
+
+    let previous: u8 = '.'
+    each local as ch {
+        if ch > 0x7f : throw .invalid { message: "'" + email + "' is not ASCII; internationalized addresses are not supported" }
+        if ch == '.' {
+            if previous == '.' : throw .invalid { message: "'" + email + "' has a '.' in the wrong place" }
+        } else if !is_atext(ch) {
+            throw .invalid { message: "'" + email + "' has a character that is not allowed before the '@'" }
+        }
+        previous = ch
+    }
+    if previous == '.' : throw .invalid { message: "'" + email + "' has a '.' in the wrong place" }
+
+    // An address literal: [192.0.2.1] or [IPv6:2001:db8::1]
+    if domain[0] == '[' && domain[domain.length - 1] == ']' {
+        each domain.range(1, domain.length - 2) as ch {
+            let ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '.' || ch == ':'
+            if !ok : throw .invalid { message: "'" + email + "' has an address literal that is not valid" }
+        }
+        return
+    }
+    let label: uint = 0
+    each domain as ch {
+        if ch > 0x7f : throw .invalid { message: "'" + email + "' is not ASCII; internationalized addresses are not supported" }
+        if ch == '.' {
+            if label == 0 : throw .invalid { message: "'" + email + "' has an empty part in its domain" }
+            label = 0
+            continue
+        }
+        let ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-'
+        if !ok : throw .invalid { message: "'" + email + "' has a character that is not allowed in a domain" }
+        label++
+        if label > 63 : throw .invalid { message: "'" + email + "' has a domain part longer than 63 characters" }
+    }
+    if label == 0 : throw .invalid { message: "'" + email + "' has an empty part in its domain" }
+}
+
+// The characters of an atom (RFC 5322), which need no quotes
+fn is_atext(ch: u8) bool {
+    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') : return true
+    return "!#$%&'*+-/=?^_`{|}~".contains_byte(ch)
+}
+
+fn trim_space(text: String) String {
+    let start: uint = 0
+    let end = text.length
+    while start < end && (text[start] == ' ' || text[start] == '\t') : start++
+    while end > start && (text[end - 1] == ' ' || text[end - 1] == '\t') : end--
+    return text.range(start, end - start)
+}
+
+// The content of a quoted-string, with its backslash escapes resolved
+fn unquote(text: String) String {
+    if !text.contains_byte('\\') : return text
+    let out = ByteBuffer.new(text.length)
+    let i: uint = 0
+    while i < text.length {
+        let ch = text[i++]
+        if ch == '\\' && i < text.length : ch = text[i++]
+        out.write_byte(ch)
+    }
+    return out.to_string()
+}
+
+// The tokens of one address in a header: the name as words, a quoted-string or encoded-words,
+// then `<email>`
+fn address_tokens(address: Address) Array[String] {
+    let email = "<" + address.email + ">"
+    if address.name.length == 0 : return .{ address.email }
+    let name = address.name
+    let tokens = Array[String]{}
+    if needs_encoding(name) || name.length > 200 {
+        tokens = encoded_words(name)
+    } else if is_phrase(name) {
+        tokens = name.split(" ")
+    } else {
+        tokens.append(quote(name))
+    }
+    tokens.append(email)
+    return tokens
+}
+
+// Whether a name can be written as it is: words of atom characters with single spaces
+fn is_phrase(name: String) bool {
+    if name[0] == ' ' || name[name.length - 1] == ' ' || name.contains("  ") : return false
+    each name as ch {
+        if ch != ' ' && !is_atext(ch) : return false
+    }
+    return true
+}
+
+// A list of addresses as header tokens, with a comma after every address but the last
+fn address_list_tokens(addresses: Array[Address]) Array[String] {
+    let tokens = Array[String]{}
+    each addresses as address, index {
+        let parts = address_tokens(address)
+        if index + 1 < addresses.length {
+            let last = parts.length - 1
+            parts.set(last, (parts.get(last) !? "") + ",") _
+        }
+        tokens.append_many(parts)
+    }
+    return tokens
+}

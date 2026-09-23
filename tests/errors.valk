@@ -1,0 +1,238 @@
+use smtp
+
+test "Errors: a refused recipient" {
+    let fake = fake_server()
+    fake.reject = .{ "cid@example.com" }
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, recipient))
+        assert(E.address == "cid@example.com")
+        assert(E.reply_code == 550)
+        assert(E.reply == "5.1.1 <cid@example.com>: Recipient address rejected")
+        assert(E.message.contains("<cid@example.com>"))
+    }
+    // No data went out, and the next message starts with a clean slate
+    assert(fake.messages.length == 0)
+    let other = smtp.Message { from: "a@example.com", to: .{ "b@example.com" }, text: "x" }
+    client.send(other) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+
+    let transcript = fake.transcript()
+    assert(transcript.contains("C: RCPT TO:<cid@example.com>\nS: 550 5.1.1 <cid@example.com>: Recipient address rejected\nC: RSET\nS: 250 2.0.0 Ok\nC: MAIL FROM:<a@example.com>"))
+    // The recipient after the refused one was never asked for
+    assert(!transcript.contains("RCPT TO:<dan@example.com>"))
+    assert(fake.messages.length == 1)
+}
+
+test "Errors: a refused sender" {
+    let fake = fake_server()
+    fake.mail_reply = "553 5.7.1 <ada@example.com>: Sender address rejected"
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, sender))
+        assert(E.reply_code == 553)
+        client.close()
+        await running
+        assert(!fake.transcript().contains("RCPT"))
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a refused message" {
+    let fake = fake_server()
+    fake.data_reply = "554 5.7.1 Message rejected as spam"
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, rejected))
+        assert(E.reply_code == 554)
+        assert(E.reply == "5.7.1 Message rejected as spam")
+        client.close()
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a refused login" {
+    let fake = fake_server()
+    fake.auth_ok = false
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "wrong"
+    config.allow_insecure_auth = true
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, auth))
+        assert(E.reply_code == 535)
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: no login mechanism in common" {
+    let fake = fake_server()
+    fake.extensions = .{ "AUTH CRAM-MD5 XOAUTH2" }
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.allow_insecure_auth = true
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, auth))
+        assert(E.message.contains("CRAM-MD5 XOAUTH2"))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a server that does not offer to log in" {
+    let fake = fake_server()
+    fake.extensions = .{ "SIZE 1000" }
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.allow_insecure_auth = true
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, auth))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a greeting that refuses" {
+    let fake = fake_server()
+    fake.greeting = "554 5.3.2 Too busy, try later"
+    let running = co serve(fake)
+    smtp.connect_with(fake_config(fake)) ! {
+        assert(error_is(E.code, connect))
+        assert(E.reply_code == 554)
+        assert(E.reply == "5.3.2 Too busy, try later")
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: something that is not SMTP" {
+    let fake = fake_server()
+    fake.greeting = "HTTP/1.1 400 Bad Request"
+    let running = co serve(fake)
+    smtp.connect_with(fake_config(fake)) ! {
+        assert(error_is(E.code, protocol))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a server that closes the connection" {
+    let fake = fake_server()
+    fake.greeting = "421 4.3.2 Service shutting down"
+    let running = co serve(fake)
+    smtp.connect_with(fake_config(fake)) ! {
+        assert(error_is(E.code, connect))
+        assert(E.reply_code == 421)
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a server that closes in the middle" {
+    let fake = fake_server()
+    fake.mail_reply = "421 4.7.0 Too many connections, try again later"
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, closed))
+        assert(E.reply_code == 421)
+        assert(client.closed)
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a server that does not answer" {
+    let fake = fake_server()
+    fake.greeting = ""
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.timeout_ms = 300
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, timeout))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: nothing listens" {
+    // A privileged port, which no test can be listening on
+    smtp.connect("127.0.0.1", 1, smtp.Security.plain) ! {
+        assert(error_is(E.code, connect))
+        assert(E.message.contains("127.0.0.1"))
+        return
+    }
+    assert(false)
+}
+
+test "Errors: data smuggled in before the TLS handshake" {
+    let fake = fake_server()
+    fake.starttls = true
+    fake.after_starttls = "250 2.0.0 Not from the server\r\n"
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.security = smtp.Security.starttls
+    config.tls = .{ verify: false }
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, tls))
+        assert(E.message.contains("before the TLS handshake"))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a closed client" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    client.close()
+    client.close() // a second close does nothing
+    await running
+    client.send(simple_message()) ! {
+        assert(error_is(E.code, closed))
+        return
+    }
+    assert(false)
+}
+
+test "Errors: a message that cannot be sent" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_config(fake)) ! { println(E.message) assert(false) return }
+    let message = smtp.Message { from: "a@example.com", text: "nobody to send to" }
+    client.send(message) ! { assert(error_is(E.code, invalid)) }
+    message.to = .{ "not an address" }
+    client.send(message) ! { assert(error_is(E.code, invalid)) }
+    message.to = .{ "b@example.com" }
+    message.subject = "Hi\r\nBcc: victim@example.com"
+    client.send(message) ! { assert(error_is(E.code, invalid)) }
+    client.send_raw("a@example.com", .{}, "Subject: x\r\n\r\nx") ! { assert(error_is(E.code, invalid)) }
+    client.send_raw("a@example.com>\r\nRCPT TO:<victim@example.com", .{ "b@example.com" }, "x") ! { assert(error_is(E.code, invalid)) }
+    client.send_raw("a@example.com", .{ "b@example.com> NOTIFY=NEVER" }, "x") ! { assert(error_is(E.code, invalid)) }
+    client.close()
+    assert(await running == "ok")
+    // None of it reached the server
+    assert(!fake.transcript().contains("MAIL"))
+}

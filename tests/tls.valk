@@ -1,0 +1,146 @@
+use smtp
+
+// Settings that trust the fake server's own certificate
+fn fake_tls_config(fake: FakeServer, security: smtp.Security) smtp.Config {
+    let config = fake_config(fake)
+    config.host = "localhost"
+    config.security = security
+    config.tls = .{ ca_file: test_cert() }
+    return config
+}
+
+test "TLS: STARTTLS" {
+    let fake = fake_server()
+    fake.starttls = true
+    let running = co serve(fake)
+    let config = fake_tls_config(fake, smtp.Security.starttls)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    assert(client.tls_active)
+    assert(client.authenticated)
+    // STARTTLS is not offered again once the connection is private
+    assert(!client.has_extension("STARTTLS"))
+    client.send(simple_message()) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+
+    let expected = "S: 220 fake.test ESMTP ready
+C: EHLO client.test
+S: 250-fake.test
+S: 250-SIZE 1000000
+S: 250-AUTH PLAIN LOGIN
+S: 250-8BITMIME
+S: 250 STARTTLS
+C: STARTTLS
+S: 220 2.0.0 Ready to start TLS
+C: EHLO client.test
+S: 250-fake.test
+S: 250-SIZE 1000000
+S: 250-AUTH PLAIN LOGIN
+S: 250 8BITMIME
+C: AUTH PLAIN AGFkYUBleGFtcGxlLmNvbQBzZWNyZXQ=
+S: 235 2.7.0 Authentication successful
+C: MAIL FROM:"
+    assert(fake.transcript().starts_with(expected))
+    assert(fake.messages.length == 1)
+}
+
+test "TLS: STARTTLS is required unless it is optional" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    smtp.connect_with(fake_tls_config(fake, smtp.Security.starttls)) ! {
+        assert(error_is(E.code, tls))
+        assert(E.message.contains("does not offer STARTTLS"))
+        await running
+        // Nothing past EHLO was said
+        assert(!fake.transcript().contains("MAIL"))
+        return
+    }
+    assert(false)
+}
+
+test "TLS: optional STARTTLS goes on without it" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_tls_config(fake, smtp.Security.starttls_optional)) ! { println(E.message) assert(false) return }
+    assert(!client.tls_active)
+    client.send(simple_message()) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+    assert(fake.messages.length == 1)
+}
+
+test "TLS: optional STARTTLS uses it when offered" {
+    let fake = fake_server()
+    fake.starttls = true
+    let running = co serve(fake)
+    let client = smtp.connect_with(fake_tls_config(fake, smtp.Security.starttls_optional)) ! { println(E.message) assert(false) return }
+    assert(client.tls_active)
+    client.close()
+    assert(await running == "ok")
+}
+
+test "TLS: implicit TLS" {
+    let fake = fake_server()
+    fake.implicit_tls = true
+    let running = co serve(fake)
+    let config = fake_tls_config(fake, smtp.Security.tls)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    config.auth = smtp.AuthMethod.login
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    assert(client.tls_active)
+    assert(client.authenticated)
+    client.send(simple_message()) ! { println(E.message) assert(false) return }
+    client.close()
+    assert(await running == "ok")
+    assert(fake.transcript().starts_with("S: 220 fake.test ESMTP ready\nC: EHLO client.test\n"))
+    assert(fake.transcript().contains("C: YWRhQGV4YW1wbGUuY29t\n"))
+    assert(fake.messages.length == 1)
+}
+
+test "TLS: an untrusted certificate is refused" {
+    let fake = fake_server()
+    fake.implicit_tls = true
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.host = "localhost"
+    config.security = smtp.Security.tls
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, tls))
+        assert(E.message.contains("certificate"))
+        await running
+        return
+    }
+    assert(false)
+}
+
+test "TLS: no verification" {
+    let fake = fake_server()
+    fake.implicit_tls = true
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.security = smtp.Security.tls
+    config.tls = .{ verify: false }
+    let client = smtp.connect_with(config) ! { println(E.message) assert(false) return }
+    assert(client.tls_active)
+    client.close()
+    assert(await running == "ok")
+}
+
+test "TLS: no password without TLS" {
+    let fake = fake_server()
+    let running = co serve(fake)
+    let config = fake_config(fake)
+    config.username = "ada@example.com"
+    config.password = "secret"
+    smtp.connect_with(config) ! {
+        assert(error_is(E.code, auth))
+        assert(E.message.contains("without TLS"))
+        await running
+        assert(!fake.transcript().contains("C: AUTH"))
+        return
+    }
+    assert(false)
+}

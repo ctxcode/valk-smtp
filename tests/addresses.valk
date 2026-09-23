@@ -1,0 +1,102 @@
+use smtp
+
+fn parsed(text: String) smtp.Address {
+    return smtp.parse_address(text) ! {
+        println("parse_address(" + text + "): " + E.message)
+        return smtp.Address { email: "" }
+    }
+}
+
+test "Addresses: the forms of an address" {
+    let bare = parsed("ada@example.com")
+    assert(bare.email == "ada@example.com" && bare.name == "")
+    assert(bare.domain() == "example.com")
+
+    let angle = parsed("  <ada@example.com>  ")
+    assert(angle.email == "ada@example.com" && angle.name == "")
+
+    let named = parsed("Ada Lovelace <ada@example.com>")
+    assert(named.email == "ada@example.com" && named.name == "Ada Lovelace")
+
+    let comma = parsed("Lovelace, Ada <ada@example.com>")
+    assert(comma.name == "Lovelace, Ada")
+
+    let quoted = parsed("\"Lovelace, Ada <the first>\" <ada@example.com>")
+    assert(quoted.name == "Lovelace, Ada <the first>" && quoted.email == "ada@example.com")
+
+    let escaped = parsed("\"Ada \\\"Countess\\\" Lovelace\" <ada@example.com>")
+    assert(escaped.name == "Ada \"Countess\" Lovelace")
+
+    let unicode = parsed("Zoë Ångström <zoe@example.com>")
+    assert(unicode.name == "Zoë Ångström")
+
+    let tagged = parsed("first.last+tag@mail.example.co.uk")
+    assert(tagged.email == "first.last+tag@mail.example.co.uk")
+    assert(parsed("o'hara@example.com").email == "o'hara@example.com")
+    assert(parsed("root@[192.0.2.1]").domain() == "[192.0.2.1]")
+    assert(parsed("root@[IPv6:2001:db8::1]").email == "root@[IPv6:2001:db8::1]")
+}
+
+test "Addresses: what is refused" {
+    let bad = Array[String]{
+        "",
+        "   ",
+        "ada",
+        "ada@",
+        "@example.com",
+        "ada example@example.com",
+        "Ada ada@example.com",
+        ".ada@example.com",
+        "ada.@example.com",
+        "a..da@example.com",
+        "ada@example..com",
+        "ada@.example.com",
+        "ada@example.com.",
+        "ada@exa_mple.com",
+        "ada@ex ample.com",
+        "Ada <ada@example.com",
+        "Ada ada@example.com>",
+        "Ada <>",
+        "Ada <ada>",
+        "Ada <ada@example.com>\r\nBcc: x@example.com",
+        "ada@example.com\n",
+        "zoë@example.com",
+        "ada@exämple.com",
+        "a\"b@example.com",
+        "<ada@example.com> SIZE=1",
+        "Ada <ada@example.com> <bob@example.com>",
+    }
+    let refused: uint = 0
+    each bad as text {
+        smtp.parse_address(text) ! {
+            if error_is(E.code, invalid) : refused++
+            continue
+        }
+        println("accepted: '" + text + "'")
+    }
+    assert(refused == bad.length)
+
+    // The limits of the parts
+    smtp.parse_address("a".pad_right('a', 65) + "@example.com") ! { assert(error_is(E.code, invalid)) }
+    smtp.parse_address("ada@" + "a".pad_right('a', 64) + ".com") ! { assert(error_is(E.code, invalid)) }
+    assert(parsed("a".pad_right('a', 64) + "@" + "a".pad_right('a', 63) + ".com").email.length == 64 + 1 + 67)
+}
+
+test "Addresses: recipients are unique" {
+    let message = smtp.Message {
+        from: "a@example.com"
+        to: .{ "Bob <bob@example.com>", "BOB@example.com" }
+        cc: .{ "cid@example.com", "bob@example.com" }
+        bcc: .{ "Cid <CID@EXAMPLE.COM>", "dan@example.com" }
+    }
+    let recipients = message.recipients() ! { assert(false) return }
+    assert(recipients.join(" ") == "bob@example.com cid@example.com dan@example.com")
+
+    message.bcc.append("not valid")
+    message.recipients() ! {
+        assert(error_is(E.code, invalid))
+        assert(E.message.contains("bcc"))
+        return
+    }
+    assert(false)
+}
