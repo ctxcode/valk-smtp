@@ -106,7 +106,7 @@ offers (`auth: smtp.AuthMethod.login` picks one). It only sends a password over 
 The client introduces itself in `EHLO` with `helo_name`, or with the address of its own end of
 the connection, as `[192.0.2.1]`, and falls back to `HELO` for a server that has no `EHLO`.
 `client.extensions` holds what the server announced, and `client.has_extension("SMTPUTF8")`
-asks for one. `debug: true` prints the conversation, credentials left out.
+asks for one.
 
 ### TLS
 
