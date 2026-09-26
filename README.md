@@ -129,17 +129,10 @@ tls: .{
 }
 ```
 
-After `STARTTLS` the client throws away what the server said before and asks again, and it
-refuses a server that sends anything between agreeing to `STARTTLS` and the handshake, since an
-attacker in the middle could have put it there.
-
 ## Sending
 
-`client.send(message)` sends `MAIL FROM` (with `SIZE` when the server announces it), a
-`RCPT TO` for everyone in `to`, `cc` and `bcc` (each address once), and the message with every
-line that starts with a dot escaped. Every message after the first on a connection starts
-with `RSET`. It returns the server's answer, which usually names the id the message was queued
-under.
+`client.send(message)` sends the message to everyone in `to`, `cc` and `bcc`, each address
+once. It returns the server's answer, which usually names the id the message was queued under.
 
 When the server refuses one recipient, nothing is sent and `recipient` is thrown with the
 address in `E.address`; the connection stays usable. `client.send_raw(from, recipients, data)`
@@ -194,7 +187,6 @@ checks the sources and `make docs` regenerates the API documentation. Override t
 - Internationalized addresses (`SMTPUTF8`): the address itself must be ASCII. Names, subjects,
   bodies and file names can hold any text.
 - Login mechanisms other than `PLAIN` and `LOGIN`, such as `XOAUTH2` or `CRAM-MD5`.
-- Client certificates for TLS, since `valk.net` has no client-side certificate setting yet.
 - `PIPELINING`, `CHUNKING` and 8-bit transfer: commands go one at a time and bodies are encoded
   to 7-bit, which every server takes.
 - Delivery status notifications (`DSN`) and partial delivery: a refused recipient stops the
