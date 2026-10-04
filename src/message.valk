@@ -187,7 +187,7 @@ fn write_text_part(out: ByteBuffer, type: String, content: String, in_multipart:
     }
     out.write("Content-Transfer-Encoding: quoted-printable\r\n\r\n")
     out.write(quoted_printable(text))
-    out.write("\r\n")
+    if in_multipart || !text.ends_with("\r\n") : out.write("\r\n")
 }
 
 fn write_attachment(out: ByteBuffer, attachment: Attachment) {

@@ -291,6 +291,9 @@ test "Rendering: quoted-printable and base64 bodies" {
     assert(wire_safe(rendered))
     assert(headers_of(rendered).contains("\r\nContent-Transfer-Encoding: quoted-printable\r\n"))
     assert(rendered.ends_with("\r\n\r\nCaf=C3=A9 cr=C3=A8me=20\r\nnext\r\n"))
+    // A body that ends with a line break gets no second one
+    message.text = "Café, the place\n"
+    assert(render(message).ends_with("\r\n\r\nCaf=C3=A9, the place\r\n"))
 
     // A line too long to send as it is breaks softly, and nothing is lost
     let long = "=".pad_right('a', 2000)
