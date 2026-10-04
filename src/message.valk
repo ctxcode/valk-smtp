@@ -266,11 +266,19 @@ fn new_boundary() String {
     return "=_" + random_hex(16)
 }
 
-/// The date as RFC 5322 writes it, such as `Tue, 22 Sep 2026 14:07:09 +0000`.
+/// The date as RFC 5322 writes it, such as `Tue, 22 Sep 2026 14:07:09 +0000`, with the offset
+/// of the zone the date is in.
 + fn format_date(date: time.DateTime) String {
     let days = Array[String]{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" }
     let months = Array[String]{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
     let day = days.get(date.day_of_week() - 1) !? "Mon"
     let month = months.get(date.month() - 1) !? "Jan"
-    return day + ", " + date.format("d ") + month + date.format(" Y H:i:s") + " +0000"
+    let offset = date.utc_offset()
+    let sign = offset < 0 ? " -" : " +"
+    let minutes = (offset < 0 ? -offset : offset) / 60
+    return day + ", " + date.format("d ") + month + date.format(" Y H:i:s") + sign + two_digits(minutes / 60) + two_digits(minutes % 60)
+}
+
+fn two_digits(value: int) String {
+    return (value < 10 ? "0" : "") + value
 }

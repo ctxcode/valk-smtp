@@ -34,7 +34,7 @@ Namespaces: [main](#main)
 + fn connect_url(text: String, timeout_ms: uint (30000)) Client !Error
 // Opens a connection described by a `Config`: greets the server, switches to TLS as `security` says, and logs in when `username` is set.
 + fn connect_with(config: Config) Client !Error
-// The date as RFC 5322 writes it, such as `Tue, 22 Sep 2026 14:07:09 +0000`.
+// The date as RFC 5322 writes it, such as `Tue, 22 Sep 2026 14:07:09 +0000`, with the offset of the zone the date is in.
 + fn format_date(date: DateTime) String
 // Reads an address as it is written in a message: `ada@example.com`, `<ada@example.com>`, `Ada Lovelace <ada@example.com>` or `"Lovelace, Ada" <ada@example.com>`.
 + fn parse_address(text: String) Address !Error

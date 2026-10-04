@@ -107,6 +107,13 @@ test "Rendering: message id and date" {
 
     let dated = time.DateTime.new(2000, 2, 29, 23, 59, 58) ! { assert(false) return }
     assert(smtp.format_date(dated) == "Tue, 29 Feb 2000 23:59:58 +0000")
+    // A date in a zone keeps its local time and says its offset
+    let kolkata = time.zone("Asia/Kolkata") ! { assert(false) return }
+    let india = time.DateTime.new_in(kolkata, 2026, 7, 1, 12, 0, 0) ! { assert(false) return }
+    assert(smtp.format_date(india) == "Wed, 01 Jul 2026 12:00:00 +0530")
+    let st_johns = time.zone("America/St_Johns") ! { assert(false) return }
+    let newfoundland = time.DateTime.new_in(st_johns, 2026, 1, 5, 8, 3, 0) ! { assert(false) return }
+    assert(smtp.format_date(newfoundland) == "Mon, 05 Jan 2026 08:03:00 -0330")
 
     let own = basic()
     own.message_id = "<order-17@shop.example.com>"
