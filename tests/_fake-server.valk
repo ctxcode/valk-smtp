@@ -95,7 +95,7 @@ fn server_context(require_client_certificate: bool) ?shared net.SslServerContext
     let context: shared net.SslServerContext = net.SslServerContext.new(test_cert(), test_key()) ! return null
     if require_client_certificate {
         // The test certificate is its own authority
-        if SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), test_cert().data, null) != 1 : return null
+        if SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), test_cert().data_cstring, null) != 1 : return null
         SSL_CTX_set_verify(context.ctx.@cast(ptr), 3, null) // SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
     }
     return context
